@@ -15,6 +15,8 @@ import asyncio
 import difflib
 import json
 import os
+import tempfile
+import threading
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -41,6 +43,10 @@ class NetworkXGraphStore:
         self._path.parent.mkdir(parents=True, exist_ok=True)
         self._g: nx.MultiDiGraph = nx.MultiDiGraph()
         self._dirty = False
+        self._mutation_revision = 0
+        self._state_lock = threading.RLock()
+        self._persist_lock = asyncio.Lock()
+        self._persist_worker_lock = threading.Lock()
         if autoload and self._path.exists():
             self._load()
         _log.info(
@@ -78,115 +84,155 @@ class NetworkXGraphStore:
             )
 
     async def persist(self) -> None:
-        if not self._dirty:
-            return
-        def _run() -> None:
-            doc = {
-                "nodes": [
-                    {
-                        "id": nid,
-                        "label": d.get("label", nid),
-                        "type": d.get("type", "entity"),
-                        "props": {k: v for k, v in d.items() if k not in {"label", "type"}},
-                    }
-                    for nid, d in self._g.nodes(data=True)
-                ],
-                "edges": [
-                    {
-                        "src": u,
-                        "dst": v,
-                        "key": key,
-                        "rel": d.get("relation", "related"),
-                        "w": float(d.get("weight", 1.0)),
-                        "props": {
-                            k: val
-                            for k, val in d.items()
-                            if k not in {"relation", "weight"}
-                        },
-                    }
-                    for u, v, key, d in self._g.edges(keys=True, data=True)
-                ],
-            }
-            temporary = self._path.with_name(f".{self._path.name}.{os.getpid()}.tmp")
-            temporary.write_text(
-                json.dumps(doc, ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
+        async with self._persist_lock:
+            await asyncio.to_thread(self._persist_sync)
+
+    def _persist_sync(self) -> None:
+        # Cancelling to_thread's awaiter does not stop its worker. Serialize
+        # capture, replacement, and dirty-state bookkeeping in the worker too,
+        # so a cancelled save cannot overwrite a later successful save.
+        with self._persist_worker_lock:
+            with self._state_lock:
+                if not self._dirty:
+                    return
+                captured_revision = self._mutation_revision
+                doc = self._document_locked()
+
+            self._write_document(doc)
+
+            with self._state_lock:
+                # A mutation may have happened while the captured document
+                # was being written. In that case the newer state is not on
+                # disk yet and must remain dirty for the next persist call.
+                if self._mutation_revision == captured_revision:
+                    self._dirty = False
+
+    def _document_locked(self) -> dict[str, Any]:
+        """Build a detached JSON document while holding ``_state_lock``."""
+        return {
+            "nodes": [
+                {
+                    "id": nid,
+                    "label": d.get("label", nid),
+                    "type": d.get("type", "entity"),
+                    "props": {k: v for k, v in d.items() if k not in {"label", "type"}},
+                }
+                for nid, d in self._g.nodes(data=True)
+            ],
+            "edges": [
+                {
+                    "src": u,
+                    "dst": v,
+                    "key": key,
+                    "rel": d.get("relation", "related"),
+                    "w": float(d.get("weight", 1.0)),
+                    "props": {
+                        k: val
+                        for k, val in d.items()
+                        if k not in {"relation", "weight"}
+                    },
+                }
+                for u, v, key, d in self._g.edges(keys=True, data=True)
+            ],
+        }
+
+    def _write_document(self, doc: dict[str, Any]) -> None:
+        """Atomically write one detached document through a unique temp file."""
+        fd, temporary = tempfile.mkstemp(
+            prefix=f".{self._path.name}.", suffix=".tmp", dir=self._path.parent,
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(doc, handle, ensure_ascii=False, indent=2)
             os.replace(temporary, self._path)
-        await asyncio.to_thread(_run)
-        self._dirty = False
+        except BaseException:
+            try:
+                os.unlink(temporary)
+            except FileNotFoundError:
+                pass
+            raise
 
     # ------------------------------------------------------------ mutation
 
     async def upsert_triples(self, triples: Sequence[GraphTriple]) -> None:
-        for t in triples:
-            # Nodes
-            for side, node_id, node_type in (
-                ("subject", t.subject, t.subject_type),
-                ("object", t.object, t.object_type),
-            ):
-                if not self._g.has_node(node_id):
-                    self._g.add_node(
-                        node_id,
-                        label=node_id,
-                        type=node_type,
-                    )
-            # Profile snapshots and runtime writes have separate identities;
-            # exact duplicates within either origin overwrite deterministically.
-            profile_managed = bool((t.properties or {}).get("_profile_managed"))
-            origin = "profile" if profile_managed else (t.source or "runtime")
-            self._g.add_edge(
-                t.subject,
-                t.object,
-                key=f"{t.relation}\x1f{origin}",
-                relation=t.relation,
-                weight=float(t.confidence),
-                source=t.source,
-                **{f"p_{k}": v for k, v in (t.properties or {}).items()},
-            )
-        self._dirty = True
+        with self._state_lock:
+            for t in triples:
+                # Nodes
+                for side, node_id, node_type in (
+                    ("subject", t.subject, t.subject_type),
+                    ("object", t.object, t.object_type),
+                ):
+                    if not self._g.has_node(node_id):
+                        self._g.add_node(
+                            node_id,
+                            label=node_id,
+                            type=node_type,
+                        )
+                # Profile snapshots and runtime writes have separate identities;
+                # exact duplicates within either origin overwrite deterministically.
+                profile_managed = bool((t.properties or {}).get("_profile_managed"))
+                origin = "profile" if profile_managed else (t.source or "runtime")
+                self._g.add_edge(
+                    t.subject,
+                    t.object,
+                    key=f"{t.relation}\x1f{origin}",
+                    relation=t.relation,
+                    weight=float(t.confidence),
+                    source=t.source,
+                    **{f"p_{k}": v for k, v in (t.properties or {}).items()},
+                )
+            self._mutation_revision += 1
+            self._dirty = True
 
     async def reconcile_profile_triples(self, triples: Sequence[GraphTriple]) -> None:
         """Replace only edges managed by the profile snapshot."""
-        stale = [
-            (u, v, key)
-            for u, v, key, data in self._g.edges(keys=True, data=True)
-            if data.get("p__profile_managed") is True
-        ]
-        self._g.remove_edges_from(stale)
+        with self._state_lock:
+            stale = [
+                (u, v, key)
+                for u, v, key, data in self._g.edges(keys=True, data=True)
+                if data.get("p__profile_managed") is True
+            ]
+            self._g.remove_edges_from(stale)
         await self.upsert_triples(triples)
         # Drop now-orphaned profile nodes without touching runtime nodes.
-        self._g.remove_nodes_from(list(nx.isolates(self._g)))
+        with self._state_lock:
+            self._g.remove_nodes_from(list(nx.isolates(self._g)))
 
     async def reconcile_source_triples(
         self, source: str, triples: Sequence[GraphTriple]
     ) -> None:
         """Replace edges produced from one source file while preserving others."""
-        stale = [
-            (u, v, key)
-            for u, v, key, data in self._g.edges(keys=True, data=True)
-            if data.get("p__source_path") == source
-        ]
-        self._g.remove_edges_from(stale)
+        with self._state_lock:
+            stale = [
+                (u, v, key)
+                for u, v, key, data in self._g.edges(keys=True, data=True)
+                if data.get("p__source_path") == source
+            ]
+            self._g.remove_edges_from(stale)
         await self.upsert_triples(triples)
-        self._g.remove_nodes_from(list(nx.isolates(self._g)))
+        with self._state_lock:
+            self._g.remove_nodes_from(list(nx.isolates(self._g)))
 
     async def reconcile_lineage_triples(
         self, root: str, triples: Sequence[GraphTriple]
     ) -> None:
         """Replace all deterministic lineage edges for one workspace root."""
-        stale = [
-            (u, v, key)
-            for u, v, key, data in self._g.edges(keys=True, data=True)
-            if data.get("p__lineage_root") == root
-        ]
-        self._g.remove_edges_from(stale)
+        with self._state_lock:
+            stale = [
+                (u, v, key)
+                for u, v, key, data in self._g.edges(keys=True, data=True)
+                if data.get("p__lineage_root") == root
+            ]
+            self._g.remove_edges_from(stale)
         await self.upsert_triples(triples)
-        self._g.remove_nodes_from(list(nx.isolates(self._g)))
+        with self._state_lock:
+            self._g.remove_nodes_from(list(nx.isolates(self._g)))
 
     async def reset(self) -> None:
-        self._g = nx.MultiDiGraph()
-        self._dirty = True
+        with self._state_lock:
+            self._g = nx.MultiDiGraph()
+            self._mutation_revision += 1
+            self._dirty = True
 
     # ------------------------------------------------------------- lookup
 
