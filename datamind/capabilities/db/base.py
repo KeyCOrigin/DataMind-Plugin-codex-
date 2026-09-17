@@ -46,7 +46,8 @@ class BaseSQLDialect:
         We apply a few safe defaults: pool_pre_ping on (handles stale
         connections), future=True (2.0-style).
         """
-        opts = dict(pool_pre_ping=True, future=True, **kwargs)
+        opts = {"pool_pre_ping": True, "future": True}
+        opts.update(kwargs)
         try:
             return create_engine(dsn, **opts)
         except SQLAlchemyError as exc:
