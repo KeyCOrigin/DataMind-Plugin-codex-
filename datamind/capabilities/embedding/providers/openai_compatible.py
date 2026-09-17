@@ -147,6 +147,10 @@ class OpenAICompatibleEmbedding:
                     )
                 resp.raise_for_status()
                 body = resp.json()
+                if not isinstance(body, dict):
+                    raise ExternalServiceError(
+                        "embedding", "response body must be an object",
+                    )
                 data = body.get("data") or []
                 if not data:
                     raise ExternalServiceError(
@@ -159,9 +163,21 @@ class OpenAICompatibleEmbedding:
                         f"response count mismatch: expected {len(inputs)}, got {len(data)}",
                     )
                 try:
-                    ordered = sorted(data, key=lambda row: int(row["index"]))
-                    indices = [int(row["index"]) for row in ordered]
-                    vecs = [list(row["embedding"]) for row in ordered]
+                    indexed_vectors = []
+                    for row in data:
+                        if not isinstance(row, dict):
+                            raise TypeError("each response row must be an object")
+                        index = row["index"]
+                        # JSON booleans are distinct from integer indices even
+                        # though bool is an int subclass in Python. Do not
+                        # coerce floats or strings: truncation can turn a
+                        # malformed response into a seemingly complete batch.
+                        if isinstance(index, bool) or not isinstance(index, int):
+                            raise ValueError("response index must be a JSON integer")
+                        indexed_vectors.append((index, list(row["embedding"])))
+                    ordered = sorted(indexed_vectors, key=lambda item: item[0])
+                    indices = [index for index, _vector in ordered]
+                    vecs = [vector for _index, vector in ordered]
                 except (KeyError, TypeError, ValueError) as exc:
                     raise ExternalServiceError(
                         "embedding", "response rows require integer index and embedding",
@@ -183,7 +199,9 @@ class OpenAICompatibleEmbedding:
                         f"dimension mismatch for {self._model}: expected {self.dimension}, got {actual_dimension}",
                     )
                 if any(
-                    not isinstance(value, (int, float)) or not math.isfinite(float(value))
+                    isinstance(value, bool)
+                    or not isinstance(value, (int, float))
+                    or not math.isfinite(float(value))
                     for vec in vecs for value in vec
                 ):
                     raise ExternalServiceError("embedding", "response contains non-finite vector values")
