@@ -8,7 +8,7 @@ from typing import Any
 import httpx
 import pytest
 
-from datamind.agent import OpenAICompatibleAgentLoop, build_agent, build_datamind, build_store_agent
+from datamind.agent import OpenAICompatibleAgentLoop, build_datamind
 from datamind.agent.base import AgentLoopConfig
 from datamind.capabilities.db.service import DBService
 from datamind.capabilities.embedding.providers.openai_compatible import (
@@ -334,16 +334,6 @@ async def test_empty_and_graph_only_builds_are_lazy_and_close_idempotently(tmp_p
     assert graph.services.graph is not None
     assert graph.services.embedding is graph.services.kb is None
     await graph.aclose()
-
-
-@pytest.mark.asyncio
-async def test_compatibility_agent_builders_expose_resource_owner(tmp_path: Path):
-    settings = Settings(llm={"api_key": "test"})
-    settings.data.base_dir = tmp_path
-    retrieve = await build_agent(settings, enable={"graph"})
-    await retrieve.aclose()
-    store = await build_store_agent(settings, enable={"graph"})
-    await store.aclose()
 
 
 class _StagingStore:

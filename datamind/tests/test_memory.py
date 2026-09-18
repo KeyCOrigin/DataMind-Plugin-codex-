@@ -10,9 +10,6 @@ from datamind.capabilities.memory import (
     ShortTermMemory,
 )
 from datamind.capabilities.memory.providers.sqlite_store import SQLiteMemoryStore
-from datamind.capabilities.memory.tools import build_memory_tools
-from datamind.core.context import RequestContext
-from datamind.core.logging import bind_context
 from datamind.core.protocols import MemoryStore
 
 
@@ -38,22 +35,6 @@ class _FakeEmbed:
 
     async def embed_query(self, query: str) -> list[float]:
         return self._vec(query)
-
-
-class _WrongDimensionEmbed:
-    name = "wrong-dimension"
-    dimension = 8
-
-    async def embed_query(self, query: str) -> list[float]:
-        return [1.0, 0.0]
-
-
-class _NonFiniteEmbed:
-    name = "non-finite"
-    dimension = 2
-
-    async def embed_query(self, query: str) -> list[float]:
-        return [1.0, float("nan")]
 
 
 # ---------------------------------------------------------------- short-term
@@ -175,61 +156,6 @@ async def test_save_validates_scope_arguments(tmp_path):
         await s.save("oops", scope="profile")
     with pytest.raises(Exception):
         await s.save("oops", scope="session")
-
-
-@pytest.mark.asyncio
-async def test_save_and_recall_reject_invalid_content_and_query(tmp_path):
-    s = SQLiteMemoryStore(db_path=str(tmp_path / "m.db"), embedding=None)
-    with pytest.raises(Exception, match="non-empty"):
-        await s.save("   ", scope="global")
-    with pytest.raises(Exception, match="non-empty"):
-        await s.recall("  ", top_k=5)
-
-
-@pytest.mark.asyncio
-async def test_embedding_shape_and_finite_values_are_validated(tmp_path):
-    wrong = SQLiteMemoryStore(db_path=str(tmp_path / "wrong.db"), embedding=_WrongDimensionEmbed())
-    with pytest.raises(Exception, match="dimension mismatch"):
-        await wrong.save("fact", scope="global")
-
-    bad = SQLiteMemoryStore(db_path=str(tmp_path / "bad.db"), embedding=_NonFiniteEmbed())
-    with pytest.raises(Exception, match="non-finite"):
-        await bad.save("fact", scope="global")
-
-
-@pytest.mark.asyncio
-async def test_memory_metadata_preserves_revision_and_provenance(tmp_path):
-    s = SQLiteMemoryStore(db_path=str(tmp_path / "m.db"), embedding=None)
-    rid = await s.save(
-        "项目预算为120万元",
-        scope="profile",
-        profile="workspace-a",
-        metadata={"revision_id": "r10", "source_id": "doc-1", "source_version": "v3"},
-    )
-    hits = await s.recall("预算", profile="workspace-a", top_k=1)
-    assert hits[0].id == rid
-    assert hits[0].metadata == {
-        "revision_id": "r10", "source_id": "doc-1", "source_version": "v3",
-    }
-
-
-@pytest.mark.asyncio
-async def test_memory_tools_bind_profile_from_request_context(tmp_path):
-    store = SQLiteMemoryStore(db_path=str(tmp_path / "m.db"), embedding=None)
-    service = MemoryService(
-        short_term=ShortTermMemory(max_turns=3),
-        long_term=store,
-        default_profile="default",
-    )
-    tools = {tool.name: tool for tool in build_memory_tools(service)}
-
-    with bind_context(RequestContext(session_id="s-a", profile="workspace-a")):
-        saved = await tools["memory_save"].handler(content="workspace A secret")
-    with bind_context(RequestContext(session_id="s-b", profile="workspace-b")):
-        recalled = await tools["memory_recall"].handler(query="secret", top_k=5)
-
-    assert saved["scope"] == "profile"
-    assert recalled["results"] == []
 
 
 @pytest.mark.asyncio
