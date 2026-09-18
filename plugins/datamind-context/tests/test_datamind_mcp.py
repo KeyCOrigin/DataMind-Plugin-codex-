@@ -33,8 +33,8 @@ def test_agent_and_router_tools_keep_all_surfaces():
 
 
 @pytest.mark.asyncio
-async def test_execute_warms_fresh_runtime_before_dispatch(monkeypatch):
-    """A restarted MCP process must reload manifests before skill tools run."""
+async def test_execute_reuses_runtime_until_factory_shutdown(monkeypatch):
+    """Skill manifests warm once and shared MCP resources close on shutdown."""
 
     class FakeSpec:
         async def handler(self, **_kwargs):
@@ -59,10 +59,12 @@ async def test_execute_warms_fresh_runtime_before_dispatch(monkeypatch):
         async def aclose(self):
             self.closed = True
 
-    fake = FakeSystem()
+    built: list[FakeSystem] = []
 
     async def build(_settings, *, enable):
         assert enable == {"kb"}
+        fake = FakeSystem()
+        built.append(fake)
         return fake
 
     class FakeSettings:
@@ -71,8 +73,14 @@ async def test_execute_warms_fresh_runtime_before_dispatch(monkeypatch):
 
     monkeypatch.setattr("datamind.config.Settings", FakeSettings)
     monkeypatch.setattr("datamind.agent.build_datamind", build)
-    result = await datamind_mcp.execute("datamind_rag_query", {"query": "x"})
+    factory = datamind_mcp.RuntimeFactory()
+    result = await datamind_mcp.execute("datamind_rag_query", {"query": "x"}, runtime_factory=factory)
+    again = await datamind_mcp.execute("datamind_rag_query", {"query": "y"}, runtime_factory=factory)
 
     assert result == {"results": []}
-    assert fake.warmup_calls == 1
-    assert fake.closed is True
+    assert again == {"results": []}
+    assert len(built) == 1
+    assert built[0].warmup_calls == 1
+    assert built[0].closed is False
+    await factory.aclose()
+    assert built[0].closed is True

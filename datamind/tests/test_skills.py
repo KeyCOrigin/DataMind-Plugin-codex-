@@ -11,6 +11,8 @@ from datamind.capabilities.skills import (
     load_skill,
 )
 from datamind.capabilities.skills.code_skills import build_code_skills
+from datamind.capabilities.skills.service import SkillsService
+from datamind.capabilities.skills.tools import build_skills_tools
 
 
 # ------------------------------------------------------------- loader ---
@@ -60,6 +62,75 @@ def test_discover_skills_scans_subdirs(tmp_path: Path):
 
     ms = discover_skills(tmp_path)
     assert [m.name for m in ms] == ["a", "b"]
+
+
+def test_discover_skills_rejects_incomplete_manifests(tmp_path: Path):
+    invalid = tmp_path / "invalid"
+    invalid.mkdir()
+    (invalid / "SKILL.md").write_text(
+        "---\nname: invalid\n---\n\nBody without description\n", encoding="utf-8",
+    )
+    malformed = tmp_path / "malformed"
+    malformed.mkdir()
+    (malformed / "SKILL.md").write_text("---\nname: malformed\n", encoding="utf-8")
+
+    assert discover_skills(tmp_path) == []
+
+
+@pytest.mark.asyncio
+async def test_profile_skill_override_and_tool_lookup_are_isolated(tmp_path: Path):
+    base = tmp_path / "base"
+    profile_a = tmp_path / "profile-a"
+    profile_b = tmp_path / "profile-b"
+    for root in (base, profile_a, profile_b):
+        root.mkdir()
+    (base / "shared").mkdir()
+    (base / "shared" / "SKILL.md").write_text(
+        "---\nname: shared\ndescription: base\n---\n\nbase body\n", encoding="utf-8",
+    )
+    (profile_a / "shared").mkdir()
+    (profile_a / "shared" / "SKILL.md").write_text(
+        "---\nname: shared\ndescription: override\n---\n\nprofile A body\n", encoding="utf-8",
+    )
+    (profile_a / "private").mkdir()
+    (profile_a / "private" / "SKILL.md").write_text(
+        "---\nname: private\ndescription: private\n---\n\nprivate body\n", encoding="utf-8",
+    )
+
+    service_a = SkillsService(
+        skills_dir=base, profile_skills_dir=profile_a, embedding=None, vector_store=None,
+    )
+    service_b = SkillsService(
+        skills_dir=base, profile_skills_dir=profile_b, embedding=None, vector_store=None,
+    )
+    await service_a.load()
+    await service_b.load()
+
+    assert service_a.get("shared")["body"] == "profile A body"
+    assert service_a.get("private")["found"] is True
+    assert service_b.get("private")["found"] is False
+
+    get_tool = next(t for t in build_skills_tools(service_a) if t.name == "skill_get")
+    assert (await get_tool.handler(name="shared"))["found"] is True
+
+
+@pytest.mark.asyncio
+async def test_skill_upsert_validates_and_reloads_manifest(tmp_path: Path):
+    service = SkillsService(
+        skills_dir=tmp_path / "base",
+        profile_skills_dir=tmp_path / "profile",
+        embedding=None,
+        vector_store=None,
+    )
+    with pytest.raises(Exception, match="description"):
+        await service.upsert(name="demo", description="", body="body")
+
+    result = await service.upsert(
+        name="Demo", description="A demo skill", body="Run the demo.", keywords=["demo"],
+    )
+    assert result["created"] is True
+    assert service.get("demo")["found"] is True
+    assert service.get("demo")["body"] == "Run the demo."
 
 
 # ---------------------------------------------------------- code skills ---
