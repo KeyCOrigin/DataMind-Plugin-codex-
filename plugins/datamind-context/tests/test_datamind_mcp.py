@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import importlib.util
+import types
 from pathlib import Path
+
+import pytest
 
 
 MODULE_PATH = Path(__file__).parents[1] / "src" / "datamind_mcp.py"
@@ -27,3 +30,49 @@ def test_agent_and_router_tools_keep_all_surfaces():
     assert datamind_mcp.enabled_surfaces("datamind_ask") is None
     assert datamind_mcp.enabled_surfaces("datamind_store") is None
     assert datamind_mcp.enabled_surfaces("datamind_surface_ingest") is None
+
+
+@pytest.mark.asyncio
+async def test_execute_warms_fresh_runtime_before_dispatch(monkeypatch):
+    """A restarted MCP process must reload manifests before skill tools run."""
+
+    class FakeSpec:
+        async def handler(self, **_kwargs):
+            return {"results": []}
+
+    class FakeTools:
+        def get(self, _name):
+            return FakeSpec()
+
+    class FakeSystem:
+        retrieve = types.SimpleNamespace(tools=FakeTools())
+        store = types.SimpleNamespace(tools=FakeTools())
+
+        def __init__(self):
+            self.warmup_calls = 0
+            self.closed = False
+
+        async def warmup(self):
+            self.warmup_calls += 1
+            return {"skills": {"manifests": 1}}
+
+        async def aclose(self):
+            self.closed = True
+
+    fake = FakeSystem()
+
+    async def build(_settings, *, enable):
+        assert enable == {"kb"}
+        return fake
+
+    class FakeSettings:
+        def __init__(self):
+            self.data = types.SimpleNamespace(profile="default")
+
+    monkeypatch.setattr("datamind.config.Settings", FakeSettings)
+    monkeypatch.setattr("datamind.agent.build_datamind", build)
+    result = await datamind_mcp.execute("datamind_rag_query", {"query": "x"})
+
+    assert result == {"results": []}
+    assert fake.warmup_calls == 1
+    assert fake.closed is True

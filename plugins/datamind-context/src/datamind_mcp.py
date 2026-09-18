@@ -179,6 +179,10 @@ async def execute(name: str, args: dict[str, Any]) -> dict[str, Any]:
     settings = Settings()
     settings.data.profile = profile
     system = await build_datamind(settings, enable=enabled_surfaces(name))
+    # A fresh MCP request builds a fresh DataMind runtime.  Load persisted
+    # Skill manifests before dispatch so skill_get/skill_list work after a
+    # process restart, just like skill_search's persisted vector index.
+    await system.warmup()
     context = RequestContext(
         session_id=str(args.get("session_id") or "codex"),
         profile=profile,
