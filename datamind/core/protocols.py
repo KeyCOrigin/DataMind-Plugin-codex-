@@ -13,7 +13,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Literal, Protocol, Sequence, runtime_checkable
 
-from pydantic import BaseModel, Field
+import math
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 # ---------------------------------------------------------------------------
@@ -49,6 +50,47 @@ class ModelStreamEvent:
     type: Literal["text", "done"]
     delta: str = ""
     response: ModelResponse | None = None
+
+
+class LabelScores(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    logprobs: dict[str, float]
+    model: str = Field(min_length=1)
+    labels: list[str] = Field(default_factory=lambda: ["A", "B", "C"])
+    position: int = 0
+    tokens: dict[str, str]
+    call_id: str = Field(min_length=1)
+    usage: dict[str, Any] = Field(default_factory=dict)
+    request_parameters: dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def validate_abc(self):
+        if self.labels != ["A", "B", "C"] or self.position != 0:
+            raise ValueError("ABC labels must share first answer position")
+        if self.tokens != {k: k for k in self.labels} or set(self.logprobs) != set(self.labels):
+            raise ValueError("Require exactly three single-token ABC logprobs")
+        if any(not math.isfinite(v) or not -9900 < v <= 0 for v in self.logprobs.values()):
+            raise ValueError("Invalid or outside-top-k logprob")
+        return self
+
+
+@runtime_checkable
+class TokenScoringModelClient(Protocol):
+    """Optional client capability: exact label log-probabilities.
+
+    Returned values are log-probabilities (not normalized probabilities) for
+    each requested label at the same answer position.  Only clients backed by
+    an upstream that actually exposes logprobs should implement this.
+    """
+
+    async def score_labels(
+        self,
+        prompt: str,
+        *,
+        labels: list[str],
+        model: str | None = None,
+        disable_thinking: bool = False,
+    ) -> LabelScores: ...
 
 
 @runtime_checkable

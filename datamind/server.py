@@ -25,7 +25,7 @@ from __future__ import annotations
 import json
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import AsyncIterator
+from typing import Any, AsyncIterator
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -125,10 +125,12 @@ def _session_id(x_session_id: str | None = Header(default=None)) -> str:
 class AskRequest(BaseModel):
     message: str = Field(..., min_length=1)
     history: list[dict] | None = None
+    context: dict[str, Any] | None = None
+    final_contract: dict[str, Any] | None = None
 
 
 class AskResponse(BaseModel):
-    answer: str
+    answer: Any = None
     iterations: int
     stop_reason: str
     usage: dict
@@ -136,6 +138,13 @@ class AskResponse(BaseModel):
     receipts: list[dict] = Field(default_factory=list)
     surfaces_used: list[str] = Field(default_factory=list)
     tool_trace: list[dict] = Field(default_factory=list)
+    # Evidence-gated orchestrator fields (empty for the plain RetrieveAgent).
+    decision: str | None = None
+    gate: dict | None = None
+    draft_id: str | None = None
+    atoms: list[dict] = Field(default_factory=list)
+    audit: dict | None = None
+    reason_codes: list[str] = Field(default_factory=list)
 
 
 # ------------------------------------------------------------- endpoints
@@ -185,10 +194,7 @@ async def ask(
 ) -> AskResponse:
     context = RequestContext(session_id=session, profile=st.settings.data.profile)
     with bind_context(context):
-        result = await st.system.retrieve.loop.run_turn(
-            user_message=req.message,
-            history=req.history or [],
-        )
+        result = await st.system.query(req.message, history=req.history or [], context=req.context, final_contract=req.final_contract)
     return AskResponse(
         answer=result["answer"],
         iterations=result["iterations"],
@@ -198,6 +204,12 @@ async def ask(
         receipts=result.get("receipts", []),
         surfaces_used=result.get("surfaces_used", []),
         tool_trace=result.get("tool_trace", []),
+        decision=result.get("decision"),
+        gate=result.get("gate"),
+        draft_id=result.get("draft_id"),
+        atoms=result.get("atoms", []),
+        audit=result.get("audit"),
+        reason_codes=result.get("reason_codes", []),
     )
 
 
@@ -236,9 +248,10 @@ async def chat(
         context = RequestContext(session_id=session, profile=st.settings.data.profile)
         with bind_context(context):
             try:
-                async for event in st.system.retrieve.loop.stream_turn(
+                async for event in st.system.stream_query(
                     user_message=req.message,
                     history=req.history or [],
+                    context=req.context, final_contract=req.final_contract,
                 ):
                     payload = json.dumps(
                         {"type": event.type, **event.data},

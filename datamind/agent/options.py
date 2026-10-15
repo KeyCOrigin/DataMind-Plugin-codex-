@@ -38,11 +38,13 @@ from datamind.core.hooks import HookChain
 from datamind.core.logging import get_logger
 from datamind.core.logging import bind_context, current_context
 from datamind.core.context import RequestContext
+from datamind.core.errors import ConfigError
 from datamind.core.model_clients import build_model_client
 from datamind.core.protocols import EmbeddingProvider, TextModelClient, ToolCallingModelClient
 from datamind.core.tools import ToolRegistry
 
 from .base import AgentLoopConfig, AgentLoopProtocol
+from .evidence_gated.recorder import EvidenceRecorderHook
 from .loop_native import NativeAgentLoop
 from .loop_openai import OpenAICompatibleAgentLoop
 from .prompts import build_retrieve_system_prompt, build_store_system_prompt
@@ -56,6 +58,8 @@ class AgentServices:
 
     client: ToolCallingModelClient
     fallback_client: TextModelClient
+    # Separate gateway used only for evidence-gated A/B/C logprob scoring.
+    scoring_client: Any = None
     embedding: EmbeddingProvider | None = None
     kb: KBService | None = None
     db: DBService | None = None
@@ -140,6 +144,18 @@ class RetrieveAgent:
             user_message=message, history=history, final_contract=final_contract,
         )
 
+    def stream_query(
+        self,
+        *,
+        user_message: str,
+        history: list[dict] | None = None,
+        final_contract: dict[str, Any] | None = None,
+    ):
+        """Thin streaming facade over the underlying tool loop."""
+        return self.loop.stream_turn(
+            user_message=user_message, history=history, final_contract=final_contract,
+        )
+
 
 @dataclass
 class StoreAgent:
@@ -176,7 +192,15 @@ class DataMind:
     retrieve_agent: RetrieveAgent
     services: AgentServices
     profile: str = "default"
+    # Optional evidence-gated orchestrator; selected by ``settings.agent.mode``.
+    evidence_agent: Any = None
+    mode: str = "retrieve"
     _closed: bool = False
+
+    def _query_agent(self) -> Any:
+        if self.mode == "evidence_gated" and self.evidence_agent is not None:
+            return self.evidence_agent
+        return self.retrieve_agent
 
     @property
     def store(self) -> StoreAgent:
@@ -206,21 +230,25 @@ class DataMind:
         with bind_context(RequestContext.new(profile=self.profile)):
             return await self.store_agent.store(message, history=history)
 
-    async def query(
-        self,
-        message: str,
-        *,
-        history: list[dict] | None = None,
-        final_contract: dict[str, Any] | None = None,
-    ) -> dict[str, Any]:
+    async def query(self, message: str, *, history: list[dict] | None = None,
+                    final_contract: dict[str, Any] | None = None,
+                    context: dict[str, Any] | None = None) -> dict[str, Any]:
+        agent = self._query_agent()
+        kwargs = {"history": history, "final_contract": final_contract}
+        if self.mode == "evidence_gated":
+            kwargs["context"] = context
         if current_context() is not None:
-            return await self.retrieve_agent.query(
-                message, history=history, final_contract=final_contract,
-            )
+            return await agent.query(message, **kwargs)
         with bind_context(RequestContext.new(profile=self.profile)):
-            return await self.retrieve_agent.query(
-                message, history=history, final_contract=final_contract,
-            )
+            return await agent.query(message, **kwargs)
+
+    def stream_query(self, *, user_message: str, history: list[dict] | None = None,
+                     final_contract: dict[str, Any] | None = None,
+                     context: dict[str, Any] | None = None):
+        kwargs = {"user_message": user_message, "history": history, "final_contract": final_contract}
+        if self.mode == "evidence_gated":
+            kwargs["context"] = context
+        return self._query_agent().stream_query(**kwargs)
 
     async def aclose(self) -> None:
         """Idempotently close clients, engines, stores, and providers."""
@@ -234,6 +262,7 @@ class DataMind:
             self.services.embedding,
             self.services.fallback_client,
             self.services.client,
+            self.services.scoring_client,
         ]
         seen: set[int] = set()
         for resource in resources:
@@ -247,18 +276,22 @@ class DataMind:
 
 def _build_hook_chain(settings: Settings) -> HookChain | None:
     cfg = settings.hooks
-    if not cfg.enabled:
+    # The evidence-gated orchestrator needs the recorder hook even when the
+    # steering hooks are disabled; it is observe-only and never blocks.
+    if not cfg.enabled and settings.agent.mode != "evidence_gated":
         return None
 
     chain_hooks: list[Any] = []
-    if cfg.path_allowlist:
-        roots: list[Path] = [Path(settings.data.data_dir), Path.cwd()]
-        roots.extend(Path(p).expanduser() for p in cfg.path_allowlist_extra)
-        chain_hooks.append(PathAllowlistHook(roots=roots))
-    if cfg.destructive_sql:
-        chain_hooks.append(DestructiveSqlHook())
-    if cfg.audit_log:
-        chain_hooks.append(AuditLogHook(audit_path=settings.data.storage_dir / "audit.jsonl"))
+    if cfg.enabled:
+        if cfg.path_allowlist:
+            roots: list[Path] = [Path(settings.data.data_dir), Path.cwd()]
+            roots.extend(Path(p).expanduser() for p in cfg.path_allowlist_extra)
+            chain_hooks.append(PathAllowlistHook(roots=roots))
+        if cfg.destructive_sql:
+            chain_hooks.append(DestructiveSqlHook())
+        if cfg.audit_log:
+            chain_hooks.append(AuditLogHook(audit_path=settings.data.storage_dir / "audit.jsonl"))
+    chain_hooks.append(EvidenceRecorderHook())
     return HookChain(chain_hooks) if chain_hooks else None
 
 
@@ -299,6 +332,33 @@ def _build_loop(
         else NativeAgentLoop
     )
     return loop_type(client=client, tools=tools, config=config, hooks=hooks)
+
+
+_SCORING_PROBE_PROMPT = (
+    "Choose among three equally likely labels.\n"
+    "A) support  B) uncertain  C) refute\n"
+    "Output only the single token A, B or C."
+)
+
+
+async def _probe_scoring(scoring: Any) -> None:
+    """Fail fast at build time when the gateway cannot return exact A/B/C logprobs.
+
+    Runs once during assembly so a gateway without ``logprobs``/``top_logprobs``
+    (or with thinking left enabled, which consumes the one-token budget) raises
+    ``ConfigError`` before any retrieval or atom generation is attempted.
+    """
+    try:
+        from datamind.core.protocols import LabelScores
+        scores = await scoring.score_labels(_SCORING_PROBE_PROMPT)
+        LabelScores.model_validate(scores.model_dump())
+    except Exception as exc:
+        raise ConfigError(
+            "evidence_gate scoring probe failed: the configured scoring gateway "
+            "did not return exact A/B/C logprobs at the first output position. "
+            "Verify logprobs/top_logprobs support and that thinking is disabled "
+            "for scoring requests."
+        ) from exc
 
 
 async def build_datamind(
@@ -433,10 +493,47 @@ async def build_datamind(
         ledger=ledger,
         hooks=hooks,
     )
+    evidence_agent = None
+    if settings.agent.mode == "evidence_gated":
+        from .evidence_gated import (
+            EvidenceGatedAgent, RetrievalBridge, EvidenceRegistry, SourceMappingResolver,
+            AnswerGenerator, AtomBuilder, ABCJudge, TokenScoringAdapter,
+        )
+        cfg = settings.evidence_gate
+        bridge = RetrievalBridge(retrieve_agent,
+            registry=EvidenceRegistry(SourceMappingResolver(settings.data.storage_dir / "ingest_receipts.jsonl")),
+            timeout_s=min(cfg.retrieval_timeout_s, cfg.total_timeout_s * 0.6))
+        answer_generator = AnswerGenerator(client, model=settings.llm.model,
+            max_output_tokens=cfg.answer_max_output_tokens, max_input_bytes=cfg.max_input_bytes)
+        atom_builder = AtomBuilder(client, model=settings.llm.model, max_atoms=cfg.max_atoms,
+            max_output_tokens=cfg.atom_max_output_tokens, max_input_bytes=cfg.max_input_bytes)
+        # A/B/C audit uses its own gateway so a logprob-capable model can be
+        # configured independently from the retrieval / atom-generation model.
+        scoring_model = cfg.scoring_model or settings.llm.model
+        scoring_llm = settings.llm.model_copy(update={
+            "model": scoring_model,
+            "api_base": cfg.scoring_api_base or settings.llm.api_base,
+            "api_key": cfg.scoring_api_key or settings.llm.api_key,
+        })
+        scoring_client = build_model_client(scoring_llm, protocol=cfg.scoring_protocol)
+        services.scoring_client = scoring_client
+        scoring = TokenScoringAdapter(scoring_client, model=scoring_model,
+            disable_thinking=cfg.scoring_disable_thinking)
+        await _probe_scoring(scoring)
+        judge = ABCJudge(scoring,
+            support_threshold=cfg.atom_support_threshold, refute_threshold=cfg.atom_refute_threshold,
+            max_input_bytes=cfg.max_input_bytes)
+        evidence_agent = EvidenceGatedAgent(bridge=bridge, answer_generator=answer_generator,
+            atom_builder=atom_builder, judge=judge,
+            min_support_ratio=cfg.min_support_ratio, require_final_support=cfg.require_final_support,
+            profile=settings.data.profile, max_atoms=cfg.max_atoms, total_timeout_s=cfg.total_timeout_s,
+            audit_path=settings.data.storage_dir / "evidence_gate_audit.jsonl")
+
     _log.info(
         "datamind_built",
         extra={
             "backend": settings.agent.backend,
+            "mode": settings.agent.mode,
             "retrieve_tools": len(retrieve_tools),
             "store_tools": len(store_tools),
             "profile": settings.data.profile,
@@ -447,6 +544,8 @@ async def build_datamind(
         retrieve_agent=retrieve_agent,
         services=services,
         profile=settings.data.profile,
+        evidence_agent=evidence_agent,
+        mode=settings.agent.mode,
     )
 
 

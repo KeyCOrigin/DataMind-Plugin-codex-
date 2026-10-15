@@ -1083,7 +1083,24 @@ async function sendMessage() {
           const last = groups[groups.length - 1];
           if (last) last.classList.add('hook-denied');
           logLine(`hook denied: ${event.tool} — ${event.reason}`);
+        } else if (['retrieving', 'answer_generation', 'atom_building', 'citation_check', 'atom_audit', 'gate'].includes(event.type)) {
+          const stages = {retrieving: '正在检索证据', answer_generation: '正在生成候选答案', atom_building: '正在构建可核验依据', citation_check: '正在核对引用', atom_audit: '正在审核依据', gate: '正在检查发布条件'};
+          logLine(stages[event.type]);
+        } else if (event.type === 'atom_audit_result') {
+          const names = {support: '支持', uncertain: '不确定', refute: '反驳'};
+          const outcome = event.execution_status === 'scored' ? names[event.verdict] : '审核错误';
+          const score = Number.isFinite(event.expected_score) ? ` · 分数 ${event.expected_score.toFixed(3)}` : '';
+          logLine(`${event.atom_id}：${outcome}${score}`);
+        } else if (event.type === 'gate_result') {
+          const ratio = Number.isFinite(event.support_ratio) ? `${(event.support_ratio * 100).toFixed(1)}%` : '—';
+          logLine(`支持 ${event.support_count} · 不确定 ${event.uncertain_count} · 反驳 ${event.refute_count} · 支持比例 ${ratio}`);
+        } else if (event.type === 'error') {
+          appendText(aiBubble, '\n处理失败：' + (event.message || '未知错误'));
         } else if (event.type === 'done') {
+          if (event.decision && event.decision !== 'answer') {
+            appendText(aiBubble, event.decision === 'error' ? '证据审核未完成，未发布答案。' : '证据不足，未发布答案。');
+            logLine((event.reason_codes || []).join(', '));
+          }
           logLine(`done: ${event.iterations} iter · stop=${event.stop_reason}`);
         }
       }

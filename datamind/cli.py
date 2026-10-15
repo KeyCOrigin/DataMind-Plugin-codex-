@@ -141,9 +141,11 @@ def ask(
         console.print(Panel.fit(question, title="Q", style="cyan"))
         context = RequestContext(session_id=session, profile=settings.data.profile)
         with bind_context(context):
-            async for event in agent.loop.stream_turn(user_message=question):
+            async for event in system.stream_query(user_message=question):
                 if event.type == "text":
                     console.print(event.data["delta"], end="")
+                elif event.type in {"retrieving", "answer_generation", "atom_building", "citation_check", "atom_audit", "gate", "atom_audit_result", "gate_result"} and show_tools:
+                    console.print(f"\n[dim][{event.type}][/dim] {json.dumps(event.data, ensure_ascii=False)[:240]}")
                 elif event.type == "tool_use" and show_tools:
                     console.print(
                         f"\n[dim][tool]:[/dim] [bold]{event.data['name']}[/bold] {json.dumps(event.data['input'], ensure_ascii=False)[:200]}"
@@ -153,6 +155,8 @@ def ask(
                     preview = (event.data.get("preview") or "")[:200].replace("\n", " ")
                     console.print(f"[dim][result {marker}][/dim] {preview}")
                 elif event.type == "done":
+                    if event.data.get("decision") in {"insufficient", "error"}:
+                        console.print("\n[yellow]未发布答案：[/yellow] " + ", ".join(event.data.get("reason_codes", [])))
                     console.print()
                     console.print(
                         f"[dim]done ({event.data.get('iterations')} iterations, "
@@ -246,11 +250,13 @@ def chat(
             collected = []
             context = RequestContext(session_id=session, profile=settings.data.profile)
             with bind_context(context):
-                async for event in agent.loop.stream_turn(user_message=q, history=history):
+                async for event in system.stream_query(user_message=q, history=history):
                     if event.type == "text":
                         delta = event.data["delta"]
                         collected.append(delta)
                         console.print(delta, end="")
+                    elif event.type in {"retrieving", "answer_generation", "atom_building", "citation_check", "atom_audit", "gate", "atom_audit_result", "gate_result"} and show_tools:
+                        console.print(f"\n[dim][{event.type}][/dim] {json.dumps(event.data, ensure_ascii=False)[:160]}")
                     elif event.type == "tool_use" and show_tools:
                         console.print(
                             f"\n[dim][tool {event.data['name']}] "
@@ -261,6 +267,8 @@ def chat(
                         preview = (event.data.get("preview") or "")[:160].replace("\n", " ")
                         console.print(f"[dim][result {marker}] {preview}[/dim]")
                     elif event.type == "done":
+                        if event.data.get("decision") in {"insufficient", "error"}:
+                            console.print("\n[yellow]未发布答案：[/yellow] " + ", ".join(event.data.get("reason_codes", [])))
                         console.print()
                         # Save a simplified turn in history.
                         answer_text = "".join(collected)

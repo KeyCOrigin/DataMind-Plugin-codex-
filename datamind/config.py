@@ -24,7 +24,7 @@ import re
 from pathlib import Path
 from typing import Literal
 
-from pydantic import AnyUrl, BaseModel, ConfigDict, Field, SecretStr, field_validator
+from pydantic import AnyUrl, BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # Repo root — one up from `datamind/`.
@@ -215,6 +215,9 @@ class AgentConfig(BaseModel):
 
     backend: Literal["native", "sdk"] = "native"
 
+    # Query strategy: plain RetrieveAgent or the evidence-gated orchestrator.
+    mode: Literal["retrieve", "evidence_gated"] = "retrieve"
+
     # Used only when backend == "sdk". Points at a local CCR instance.
     # Falls back to 127.0.0.1:13456 (our default bootstrap port). Auth is
     # a nominal value — CCR doesn't check the incoming key, only the one
@@ -230,6 +233,64 @@ class AgentConfig(BaseModel):
     max_tool_result_rows: int = Field(default=100, ge=1)
     wall_clock_timeout_s: float = Field(default=300.0, gt=0)
     finalization_reserve_s: float = Field(default=20.0, ge=0)
+
+
+class EvidenceGateConfig(BaseModel):
+    """Answer-first generation and evidence/atom audit. Tune thresholds on validation data.
+
+    ABC scoring reads true token log-probabilities from an OpenAI-compatible
+    gateway, so it is deliberately decoupled from the retrieval / atom
+    generation model.  ``scoring_*`` fields default to the primary LLM; set
+    them explicitly when the audit model is hosted behind a different gateway
+    or API key.
+    """
+    model_config = ConfigDict(extra="forbid")
+    scoring_mode: Literal["abc"] = "abc"
+    atom_support_threshold: float = Field(default=0.3, ge=-1.0, le=1.0, allow_inf_nan=False)
+    atom_refute_threshold: float = Field(default=-0.3, ge=-1.0, le=1.0, allow_inf_nan=False)
+    min_support_ratio: float = Field(default=0.8, gt=0.0, le=1.0, allow_inf_nan=False)
+    require_final_support: bool = False
+    max_atoms: int = Field(default=24, ge=1)
+    answer_max_output_tokens: int = Field(default=4096, gt=0)
+    atom_max_output_tokens: int = Field(default=8192, gt=0)
+    max_input_bytes: int = Field(default=200000, gt=0)
+    retrieval_timeout_s: float = Field(default=180.0, gt=0)
+    total_timeout_s: float = Field(default=300.0, gt=0)
+    # Scoring (ABC logprob audit) gateway; falls back to the primary LLM when
+    # None.  Only OpenAI Chat Completions exposes per-token logprobs.
+    scoring_model: str | None = None
+    scoring_api_base: AnyUrl | None = None
+    scoring_api_key: SecretStr | None = None
+    scoring_protocol: Literal["openai_chat_completions"] = "openai_chat_completions"
+    # Reasoning models consume the one-token budget with a thinking token
+    # unless thinking is explicitly disabled for scoring requests.
+    scoring_disable_thinking: bool = True
+
+    @model_validator(mode="before")
+    @classmethod
+    def reject_ab_config(cls, value):
+        if isinstance(value, dict) and set(value).intersection(
+                {"tau_local", "tau_final", "calibration_a", "calibration_b", "calibration_version"}):
+            raise ValueError("ABC_CONFIG_MIGRATION_REQUIRED: remove A/B thresholds and Platt parameters; "
+                             "set atom_support_threshold, atom_refute_threshold and min_support_ratio")
+        return value
+
+    @model_validator(mode="after")
+    def validate_abc_thresholds(self):
+        if self.atom_refute_threshold >= self.atom_support_threshold:
+            raise ValueError("atom_refute_threshold must be less than atom_support_threshold")
+        return self
+
+    @model_validator(mode="before")
+    @classmethod
+    def migrate_generation_budget(cls, value):
+        if isinstance(value, dict) and "max_output_tokens" in value:
+            value = dict(value)
+            legacy = value.pop("max_output_tokens")
+            if "atom_max_output_tokens" in value and value["atom_max_output_tokens"] != legacy:
+                raise ValueError("Conflicting max_output_tokens and atom_max_output_tokens")
+            value.setdefault("atom_max_output_tokens", legacy)
+        return value
 
 
 class HooksConfig(BaseModel):
@@ -279,6 +340,7 @@ class Settings(BaseSettings):
     logging: LoggingConfig = LoggingConfig()
     agent: AgentConfig = AgentConfig()
     hooks: HooksConfig = HooksConfig()
+    evidence_gate: EvidenceGateConfig = EvidenceGateConfig()
 
     model_config = SettingsConfigDict(
         # Two files tried in order; later entries take precedence.
@@ -309,4 +371,5 @@ __all__ = [
     "LoggingConfig",
     "AgentConfig",
     "HooksConfig",
+    "EvidenceGateConfig",
 ]

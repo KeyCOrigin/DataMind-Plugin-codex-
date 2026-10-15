@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
+from uuid import uuid4
 import random
 from typing import Any, AsyncIterator
 
@@ -19,7 +21,7 @@ from datamind.config import LLMConfig
 
 from .errors import ConfigError, ExternalServiceError
 from .logging import current_context
-from .protocols import ModelResponse, ModelStreamEvent, ModelUsage
+from .protocols import ModelResponse, ModelStreamEvent, ModelUsage, LabelScores
 
 
 def _record_nested_usage(response: ModelResponse) -> None:
@@ -380,6 +382,72 @@ class OpenAIChatCompletionsModelClient:
             for block in response.content
             if block.get("type") == "text"
         ).strip()
+
+    async def score_labels(
+        self,
+        prompt: str,
+        *,
+        labels: list[str],
+        model: str | None = None,
+        disable_thinking: bool = False,
+    ) -> LabelScores:
+        """Read exact A/B/C tokens at the first output position; fail closed."""
+        requested = model or self._default_model or ""
+        payload = {"model": requested, "messages": [{"role": "user", "content": prompt}],
+                   "max_tokens": 1, "temperature": 1.0, "logprobs": True, "top_logprobs": 20}
+        if disable_thinking:
+            # DeepSeek reasoning models default to thinking on; a one-token
+            # budget can then produce only a reasoning token and no A/B/C
+            # answer position. Explicitly disabling keeps the first decoded
+            # position as the sampled answer token.
+            payload["thinking"] = {"type": "disabled"}
+        # Temperature 1 avoids a provider returning a degenerate greedy distribution.
+        response = await self._post(payload)
+        try:
+            body = response.json()
+        except ValueError as exc:
+            raise ExternalServiceError("llm", "invalid scoring JSON", cause=exc) from exc
+        scores = self._parse_score_labels(body, labels, model=requested)
+        scores.request_parameters = {k: v for k, v in payload.items() if k != "messages"}
+        _record_nested_usage(ModelResponse(content=[], stop_reason="stop",
+            usage=ModelUsage(input_tokens=int(scores.usage.get("prompt_tokens", 0)),
+                             output_tokens=int(scores.usage.get("completion_tokens", 0))),
+            resolved_model=scores.model))
+        return scores
+
+    @staticmethod
+    def _parse_score_labels(body: dict[str, Any], labels: list[str], *, model: str = "") -> LabelScores:
+        if labels != ["A", "B", "C"]:
+            raise ExternalServiceError("llm", "only exact A/B/C single tokens are supported")
+        choices = body.get("choices") or []
+        positions = ((choices[0].get("logprobs") or {}).get("content") or []) if choices else []
+        if len(positions) != 1 or not isinstance(positions[0], dict):
+            raise ExternalServiceError("llm", "SCORING_UNAVAILABLE: missing first-position logprobs")
+        first = positions[0]
+        if first.get("token") not in labels:
+            raise ExternalServiceError("llm", "SCORING_UNAVAILABLE: output is not one exact ABC label")
+        scores = {}
+        candidates = [first] + (first.get("top_logprobs") or [])
+        for label in labels:
+            for item in candidates:
+                if not isinstance(item, dict) or item.get("token") != label:
+                    continue
+                try:
+                    raw_score = item["logprob"]
+                    if isinstance(raw_score, bool) or not isinstance(raw_score, (int, float)):
+                        raise ValueError("logprob must be numeric")
+                    score = float(raw_score)
+                except (TypeError, ValueError, KeyError) as exc:
+                    raise ExternalServiceError("llm", "invalid label logprob", cause=exc) from exc
+                if not math.isfinite(score) or score > 0 or score <= -9900:
+                    raise ExternalServiceError("llm", "invalid or outside-top-k label logprob")
+                scores[label] = score
+                break
+            if label not in scores:
+                raise ExternalServiceError("llm", f"SCORING_UNAVAILABLE: exact token {label!r} missing at position 0")
+        return LabelScores(logprobs=scores,
+            model=str(body.get("model") or model), call_id=str(body.get("id") or uuid4().hex),
+            tokens={k: k for k in labels}, usage=body.get("usage") or {})
 
     async def stream(self, **kwargs: Any) -> AsyncIterator[ModelStreamEvent]:
         payload = self._payload(**kwargs)

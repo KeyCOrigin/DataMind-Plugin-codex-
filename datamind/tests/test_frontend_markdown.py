@@ -67,3 +67,17 @@ def test_chat_and_store_responses_use_markdown_renderer():
     assert "const html = DataMindMarkdown.renderMarkdown(raw);" in app
     assert "aiBubble.dataset.raw = [result.answer" in app
     assert "renderMarkdown(aiBubble);" in app
+
+
+def test_answer_first_phases_have_frontend_labels():
+    app = (ROOT / "static" / "app.html").read_text(encoding="utf-8")
+    assert "answer_generation: '正在生成候选答案'" in app
+    assert "atom_building: '正在构建可核验依据'" in app
+    assert "'retrieving', 'answer_generation', 'atom_building', 'citation_check'" in app
+
+
+def test_abc_states_and_gate_statistics_have_frontend_labels():
+    app = (ROOT / "static" / "app.html").read_text(encoding="utf-8")
+    assert "atom_audit_result" in app and "gate_result" in app
+    for label in ("支持", "不确定", "反驳", "审核错误", "支持比例"):
+        assert label in app

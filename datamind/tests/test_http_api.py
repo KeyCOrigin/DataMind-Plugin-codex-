@@ -115,9 +115,21 @@ def configured_app(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         tools=_registry("store"),
         revision=1,
     )
+
+    async def _query(message, history=None, context=None, final_contract=None):
+        result = await retrieve.loop.run_turn(user_message=message, history=history)
+        result["decision"] = None
+        result["gate"] = None
+        return result
+
+    def _stream_query(*, user_message, history=None, context=None, final_contract=None):
+        return retrieve.loop.stream_turn(user_message=user_message, history=history)
+
     system = SimpleNamespace(
         retrieve=retrieve,
         store=store,
+        query=_query,
+        stream_query=_stream_query,
         services=SimpleNamespace(
             kb=_FakeKB(),
             memory=_FakeMemory(),
@@ -218,3 +230,29 @@ async def test_chat_converts_stream_failure_to_sse_error(configured_app):
     assert '"type": "text"' in response.text
     assert '"type": "error"' in response.text
     assert '"message": "stream failed: RuntimeError"' in response.text
+
+
+class _DeferredStream:
+    async def stream_query(self, *, user_message, history=None, context=None, final_contract=None):
+        yield AgentEvent("retrieving", {"question": user_message})
+        yield AgentEvent("answer_generation", {})
+        yield AgentEvent("atom_building", {})
+        yield AgentEvent("rejected", {"answer": "当前证据不足"})
+        yield AgentEvent("done", {"result": {"decision": "reject"}})
+
+
+@pytest.mark.asyncio
+async def test_chat_evidence_gated_defers_answer(configured_app):
+    test_app, _settings = configured_app
+    test_app.state.datamind.system.stream_query = _DeferredStream().stream_query
+    transport = httpx.ASGITransport(app=test_app, raise_app_exceptions=True)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        response = await client.post("/api/chat", json={"message": "stream this"})
+
+    assert response.status_code == 200
+    assert '"type": "retrieving"' in response.text
+    assert '"type": "answer_generation"' in response.text
+    assert '"type": "atom_building"' in response.text
+    assert '"type": "rejected"' in response.text
+    assert '"type": "text"' not in response.text

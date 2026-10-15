@@ -36,6 +36,8 @@ class AgentEvent:
         "tool_result"  — the tool finished
                          (`data["name"]`, `data["is_error"]`,
                           `data["preview"]`  — truncated string)
+        "atom_audit_result" — execution status, ABC verdict/probabilities/score
+        "gate_result"  — support/uncertain/refute counts and release decision
         "error"        — unrecoverable loop error (`data["message"]`)
         "done"         — end of turn (`data["iterations"]`,
                          `data["stop_reason"]`, `data["usage"]`)
@@ -69,6 +71,35 @@ class AgentLoopConfig:
 
 
 # ---------------------------------------------------------------- protocol
+
+
+@runtime_checkable
+class QueryAgentProtocol(Protocol):
+    """High-level query contract shared by RetrieveAgent and EvidenceGatedAgent.
+
+    Distinct from ``AgentLoopProtocol``, which describes the underlying
+    tool-use loop.  ``query`` returns a result dict; ``stream_query`` yields
+    ``AgentEvent`` items and only publishes the final answer after its gate
+    passes.
+    """
+
+    async def query(
+        self,
+        message: str,
+        *,
+        history: list[dict] | None = None,
+        final_contract: dict[str, Any] | None = None,
+        context: dict[str, Any] | None = None,
+    ) -> dict[str, Any]: ...
+
+    def stream_query(
+        self,
+        *,
+        user_message: str,
+        history: list[dict] | None = None,
+        final_contract: dict[str, Any] | None = None,
+        context: dict[str, Any] | None = None,
+    ) -> AsyncIterator[AgentEvent]: ...
 
 
 @runtime_checkable
@@ -117,6 +148,7 @@ __all__ = [
     "AgentEvent",
     "AgentLoopConfig",
     "AgentLoopProtocol",
+    "QueryAgentProtocol",
     "OnToolStart",
     "OnToolEnd",
 ]

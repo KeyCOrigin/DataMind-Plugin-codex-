@@ -23,8 +23,6 @@ from datamind.core.errors import ConfigError, ExternalServiceError
 from datamind.core.model_clients import OpenAIChatCompletionsModelClient
 from datamind.core.protocols import QueryResult, RetrievedChunk, TableSchema
 from datamind.core.tools import ToolRegistry, ToolSpec
-from benchmark.evaluate import exact_match, load_results
-from benchmark.run import _load_completed, run_benchmark
 
 
 @pytest.mark.asyncio
@@ -472,6 +470,9 @@ async def test_incremental_ingest_marks_service_when_manifest_write_fails(
 
 @pytest.mark.asyncio
 async def test_benchmark_checkpoints_and_resumes_without_duplicate_rows(tmp_path: Path):
+    pytest.importorskip("benchmark.evaluate", reason="Uploaded package does not include repository benchmark module")
+    from benchmark.evaluate import exact_match, load_results
+    from benchmark.run import _load_completed, run_benchmark
     class _System:
         def __init__(self):
             self.calls: list[str] = []
