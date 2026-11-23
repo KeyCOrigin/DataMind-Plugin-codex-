@@ -62,6 +62,17 @@ def put_graph(root, triples):
     return key
 
 
+def graph_artifacts_available(root, sources):
+    keys = {s["graph_artifact"] for s in sources if s.get("graph_artifact")}
+    if not keys:
+        return True
+    path = Path(root) / "graph.sqlite3"
+    if not path.is_file():
+        return False
+    with closing(sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)) as db:
+        return keys <= {row[0] for row in db.execute("SELECT id FROM artifacts")}
+
+
 def prune_graph(root, manifests, *, compact=False):
     if not (Path(root) / "graph.sqlite3").exists():
         return

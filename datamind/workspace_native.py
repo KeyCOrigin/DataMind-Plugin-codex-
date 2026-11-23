@@ -15,6 +15,7 @@ import signal
 import time
 import socket
 import subprocess
+import uuid
 from contextlib import asynccontextmanager
 from datetime import timedelta
 from filelock import AsyncFileLock
@@ -169,6 +170,15 @@ class DoltRepository:
                     await blocking(engine.dispose)
                 await blocking(dialect.aclose)
 
+    async def has_commit(self, commit):
+        async with self.session() as (dialect, engine):
+            rows = await blocking(
+                dialect._run_sql, engine,
+                "SELECT tag_hash FROM dolt_tags WHERE tag_name=:tag",
+                {"tag": "dm_" + commit},
+            )
+            return bool(rows and rows[0][0] == commit)
+
     async def build(self, base, tables, revision):
         async with self.session() as (dialect, root_engine):
 
@@ -176,7 +186,7 @@ class DoltRepository:
                 return dialect._run_sql(root_engine, query, params)
 
             initial = (await blocking(sql, "SELECT DOLT_HASHOF('main')"))[0][0]
-            branch = "dm_build_" + revision.removeprefix("revision-")
+            branch = "dm_build_" + uuid.uuid4().hex
             await blocking(
                 sql,
                 "CALL DOLT_BRANCH(:branch,:base)",

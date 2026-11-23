@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import re
+import stat
 import struct
 import tempfile
 import time
@@ -20,6 +21,7 @@ from datamind.capabilities.ingest.formats import (
     DOCUMENT_EXTS,
     TABLE_EXTS,
     extract_document,
+    xlsx_rows_without_empty_tail,
 )
 from datamind.capabilities.kb.indexer import _hash, _split_text
 from datamind.workspace_native import blocking, completed
@@ -72,6 +74,68 @@ def save_artifact(root, key, value):
     return path.relative_to(root).as_posix()
 
 
+def vector_cached(path, dimension):
+    try:
+        info = path.stat()
+    except FileNotFoundError:
+        return False
+    if not stat.S_ISREG(info.st_mode) or info.st_size <= 0:
+        return False
+    if dimension is None:
+        return info.st_size % 4 == 0
+    return info.st_size == 4 * dimension
+
+
+def persist_vector_batch(root, batch, vectors, dimension):
+    if len(vectors) != len(batch):
+        raise CapabilityError("kb", "embedding count mismatch")
+    if any(len(vector) != dimension for vector in vectors):
+        raise CapabilityError("kb", "embedding dimension mismatch")
+    for (_, ref), vector in zip(batch, vectors):
+        dest = root / ref
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        data = struct.pack("<" + "f" * dimension, *vector)
+        fd, temporary = tempfile.mkstemp(dir=dest.parent, prefix=".vector-")
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(data)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, dest)
+        finally:
+            Path(temporary).unlink(missing_ok=True)
+
+
+async def embed_missing_vectors(root, missing, embedding, batch_size, metrics):
+    if batch_size < 1:
+        raise ConfigError("Embedding batch size must be positive")
+    for offset in range(0, len(missing), batch_size):
+        batch = missing[offset : offset + batch_size]
+        vectors = await embedding.embed_texts([text for text, _ in batch])
+        await blocking(persist_vector_batch, root, batch, vectors, embedding.dimension)
+        metrics["embedding_calls"] += 1
+        metrics["embedding_texts"] += len(batch)
+
+
+def kb_version_available(root, binding):
+    import lancedb
+
+    path = root / binding["path"]
+    if not path.is_dir():
+        return False
+    try:
+        table = lancedb.connect(path).open_table("workspace")
+        table.checkout(binding["version"])
+        ids = table.search(None).select(["id"]).to_list()
+        return (
+            table.schema.field("embedding").type.list_size == binding["dimension"]
+            and len(ids) == len(binding["chunks"])
+            and {row["id"] for row in ids} == set(binding["chunks"])
+        )
+    except (FileNotFoundError, KeyError, ValueError, RuntimeError):
+        return False
+
+
 def canonical_tables(workspace, item, snapshot):
     """Stream CSV/TSV and XLSX rows into immutable typed-cell table objects."""
     source = Path(item["uri"])
@@ -94,10 +158,10 @@ def canonical_tables(workspace, item, snapshot):
         book = openpyxl.load_workbook(snapshot, read_only=True, data_only=True)
         closers.append(book)
         for sheet in book.worksheets:
-            rows = iter(sheet.values)
-            header = next(rows, None)
-            if header is not None:
-                streams.append((sheet.title, header, rows))
+            values, width = xlsx_rows_without_empty_tail(sheet)
+            if width:
+                rows = iter(row + (None,) * (width - len(row)) for row in values)
+                streams.append((sheet.title, next(rows), rows))
     else:
         raise ConfigError(
             "Incremental DB supports CSV, TSV and XLSX; convert legacy XLS first"
@@ -193,7 +257,7 @@ async def update_incremental(
     graph_sources,
 ):
     from datamind.workspace import _atomic_json
-    from datamind.workspace_graph import put_graph
+    from datamind.workspace_graph import graph_artifacts_available, put_graph
     from datamind.workspace_native import DoltRepository
 
     selected = set(surfaces)
@@ -309,9 +373,16 @@ async def update_incremental(
         "max_triples_per_file": max_triples_per_file,
         "applied_skills": skills,
     }
+    if "db" in selected and any(Path(item["uri"]).suffix.lower() == ".xlsx" for item in inventory):
+        recipe["xlsx_schema"] = "trim-empty-tail-v1"
     pipeline = digest(encoded(recipe))
-    revision = "revision-" + uuid.uuid4().hex
-    metrics["workspace_revision"] = revision
+    # The input plan intentionally excludes graph assertions and graph policy.
+    # Correcting the graph must not invalidate completed KB and DB bindings.
+    data_pipeline = digest(encoded({
+        k: v for k, v in recipe.items() if k not in {"relation_types", "max_triples_per_file"}
+    }))
+    plan = digest(encoded(["incremental-resume-v1", parent, epoch, str(source), inventory, sorted(selected)]))
+    graph_key = digest(encoded([relation_types, max_triples_per_file, assertions]))
     async with _writer(workspace):
         with workspace._lock(), workspace._connect() as db:
             if db.execute(
@@ -320,11 +391,31 @@ async def update_incremental(
                 raise CapabilityError(
                     "workspace", "publication conflict; current revision changed"
                 )
-            db.execute(
-                "INSERT INTO revisions VALUES (?,?,?,NULL)",
-                (revision, parent, "BUILDING"),
-            )
-            db.execute("INSERT INTO incremental_builds VALUES (?)", (revision,))
+            saved = db.execute(
+                """SELECT p.revision,p.receipt FROM incremental_progress p
+                   JOIN revisions r ON r.id=p.revision
+                   WHERE p.plan=? AND r.state IN ('BUILDING','FAILED')""",
+                (plan,),
+            ).fetchone()
+            if saved:
+                revision, payload = saved
+                progress = json.loads(payload)
+                db.execute("UPDATE revisions SET state='BUILDING',error=NULL WHERE id=?", (revision,))
+            else:
+                revision = "revision-" + uuid.uuid4().hex
+                progress = {"format_version": 2, "sources": [], "snapshots": {}}
+                db.execute(
+                    "INSERT INTO revisions VALUES (?,?,?,NULL)", (revision, parent, "BUILDING")
+                )
+                db.execute("INSERT INTO incremental_builds VALUES (?)", (revision,))
+                db.execute(
+                    "INSERT INTO incremental_progress VALUES (?,?,?,?)",
+                    (revision, epoch, plan, json.dumps(progress)),
+                )
+            # A new plan supersedes the last interrupted build in this profile.
+            db.execute("DELETE FROM incremental_progress WHERE revision<>?", (revision,))
+        metrics["workspace_revision"] = revision
+        metrics["resumed_surfaces"] = []
         root = workspace.root / "revisions" / revision
         _atomic_json(root / "build.json", {"format_version": 2, "parent": parent})
         embedding = None
@@ -332,11 +423,45 @@ async def update_incremental(
         bindings = {}
         all_chunks = {}
         tables = {}
-        try:
-            if "kb" in selected:
+        pinned_vectors = set(progress.get("vector_refs", ()))
+
+        def write_progress():
+            with workspace._connect() as db:
+                db.execute("UPDATE incremental_progress SET receipt=? WHERE revision=?",
+                           (json.dumps(progress), revision))
+
+        def save_progress(surface):
+            if surface == "graph":
+                progress["graph_sources"] = {
+                    s["uri"]: {"graph_artifact": s["graph_artifact"], "truncated": s["truncated"]}
+                    for s in sources
+                }
+            graph_refs = progress.get("graph_sources", {})
+            progress["sources"] = [{**s, **graph_refs.get(s["uri"], {})} for s in sources]
+            progress["snapshots"][surface] = bindings[surface]
+            write_progress()
+
+        embedding_recipe = cfg.embedding.model_dump(mode="json", exclude={"api_key"})
+        embedding_fingerprint = digest(encoded(embedding_recipe))
+        old_kb = old.get("snapshots", {}).get("kb") if old and old.get("format_version") == 2 else None
+        dimension = cfg.embedding.dimension
+        if dimension is None and old_kb and old_kb["embedding_fingerprint"] == embedding_fingerprint:
+            dimension = old_kb["dimension"]
+        if dimension is None and progress.get("vector_embedding_fingerprint") == embedding_fingerprint:
+            dimension = progress.get("vector_dimension")
+
+        def load_embedding():
+            nonlocal embedding, dimension
+            if embedding is None:
                 from datamind import runtime
 
                 embedding = runtime.build_embedding(cfg.embedding, fallback_llm=cfg.llm)
+                if dimension is not None and embedding.dimension != dimension:
+                    raise CapabilityError("kb", "embedding dimension mismatch")
+                dimension = embedding.dimension
+            return embedding
+
+        try:
             for item in inventory:
                 start = time.monotonic()
                 original = Path(
@@ -376,22 +501,7 @@ async def update_incremental(
                     finally:
                         Path(temp).unlink(missing_ok=True)
                 metrics["source_copy_ms"] += (time.monotonic() - start) * 1000
-                assertion = assertions.get(item["uri"])
-                graph_ref = (
-                    prior.get(item["uri"], {}).get("graph_artifact")
-                    if assertion is None
-                    else None
-                )
-                key = digest(
-                    encoded(
-                        [
-                            item["uri"],
-                            item["version"],
-                            pipeline,
-                            assertion if assertion is not None else graph_ref,
-                        ]
-                    )
-                )
+                key = digest(encoded([item["uri"], item["version"], data_pipeline, "prepared-data-v1"]))
                 artifact = workspace.root / "artifacts" / key[:2] / (key + ".json")
                 start = time.monotonic()
                 if artifact.exists():
@@ -399,12 +509,11 @@ async def update_incremental(
                     metrics["sources_reused"] += 1
                     metrics["checkpoint_read_ms"] += (time.monotonic() - start) * 1000
                 else:
-                    # Fast reuse for omitted, unchanged graph assertions.
+                    # Read existing v2 manifests as well as independently prepared data.
                     previous = prior.get(item["uri"], {})
                     if (
-                        assertion is None
-                        and old
-                        and old["pipeline_hash"] == pipeline
+                        old
+                        and (old.get("data_pipeline_hash") == data_pipeline or old["pipeline_hash"] == pipeline)
                         and previous.get("version") == item["version"]
                     ):
                         artifact = workspace.root / previous["artifact"]
@@ -412,11 +521,6 @@ async def update_incremental(
                         metrics["sources_reused"] += 1
                     elif item["uri"] in getattr(workspace, "_migration_prepared", {}):
                         prepared = dict(workspace._migration_prepared[item["uri"]])
-                        if "graph" in selected:
-                            prepared["graph_artifact"] = put_graph(
-                                workspace.root,
-                                assertion["triples"] if assertion else [],
-                            )
                         artifact = workspace.root / save_artifact(
                             workspace.root, key, prepared
                         )
@@ -435,13 +539,11 @@ async def update_incremental(
                                 chunk_size=cfg.retrieval.chunk_size,
                                 chunk_overlap=cfg.retrieval.chunk_overlap,
                             )
-                            vector_recipe = cfg.embedding.model_dump(
-                                mode="json", exclude={"api_key"}
-                            )
                             missing = []
+                            missing_refs = set()
                             refs = []
                             for part in parts:
-                                vector_key = digest(encoded([vector_recipe, part]))
+                                vector_key = digest(encoded([embedding_recipe, part]))
                                 ref = (
                                     "vectors/"
                                     + vector_key[:2]
@@ -450,41 +552,27 @@ async def update_incremental(
                                     + ".f32"
                                 )
                                 refs.append(ref)
-                                if not (workspace.root / ref).exists() and ref not in {
-                                    r for _, r in missing
-                                }:
+                                if ref not in missing_refs and not vector_cached(workspace.root / ref, dimension):
                                     missing.append((part, ref))
+                                    missing_refs.add(ref)
+                            dirty = False
                             if missing:
-                                vectors = await embedding.embed_texts(
-                                    [p for p, _ in missing]
+                                load_embedding()
+                                if progress.get("vector_embedding_fingerprint") != embedding_fingerprint:
+                                    progress["vector_embedding_fingerprint"] = embedding_fingerprint
+                                    progress["vector_dimension"] = dimension
+                                    dirty = True
+                            if new_refs := set(refs) - pinned_vectors:
+                                # Register planned objects before the first batch can reach disk.
+                                pinned_vectors.update(new_refs)
+                                progress["vector_refs"] = sorted(pinned_vectors)
+                                dirty = True
+                            if dirty:
+                                write_progress()
+                            if missing:
+                                await embed_missing_vectors(
+                                    workspace.root, missing, embedding, cfg.embedding.batch_size, metrics
                                 )
-                                if len(vectors) != len(missing):
-                                    raise CapabilityError(
-                                        "kb", "embedding count mismatch"
-                                    )
-                                from datamind.workspace import _atomic_json
-
-                                for (_, ref), vector in zip(missing, vectors):
-                                    if len(vector) != embedding.dimension:
-                                        raise CapabilityError(
-                                            "kb", "embedding dimension mismatch"
-                                        )
-                                    dest = workspace.root / ref
-                                    dest.parent.mkdir(parents=True, exist_ok=True)
-                                    data = struct.pack("<" + "f" * len(vector), *vector)
-                                    fd, temporary = tempfile.mkstemp(
-                                        dir=dest.parent, prefix=".vector-"
-                                    )
-                                    try:
-                                        with os.fdopen(fd, "wb") as handle:
-                                            handle.write(data)
-                                            handle.flush()
-                                            os.fsync(handle.fileno())
-                                        os.replace(temporary, dest)
-                                    finally:
-                                        Path(temporary).unlink(missing_ok=True)
-                                metrics["embedding_calls"] += 1
-                                metrics["embedding_texts"] += len(missing)
                             prepared["chunks"] = [
                                 {
                                     "id": _hash(part, item["uri"], ordinal=i),
@@ -500,18 +588,6 @@ async def update_incremental(
                                 }
                                 for i, part in enumerate(parts)
                             ]
-                        if "graph" in selected:
-                            if assertion is not None:
-                                prepared["graph_artifact"] = put_graph(
-                                    workspace.root, assertion["triples"]
-                                )
-                                prepared["truncated"] = assertion["truncated"]
-                            elif graph_ref:
-                                prepared["graph_artifact"] = graph_ref
-                            else:
-                                prepared["graph_artifact"] = put_graph(
-                                    workspace.root, []
-                                )
                         if "db" in selected and suffix in TABLE_EXTS:
                             prepared["tables"] = await blocking(
                                 canonical_tables, workspace, item, blob
@@ -529,8 +605,8 @@ async def update_incremental(
                     "source_id": "file:" + digest(item["uri"].encode()),
                     "snapshot": blob_ref,
                     "artifact": artifact.relative_to(workspace.root).as_posix(),
-                    "graph_artifact": prepared["graph_artifact"],
-                    "truncated": prepared["truncated"],
+                    "graph_artifact": None,
+                    "truncated": False,
                 }
                 sources.append(source_entry)
                 all_chunks.update((c["id"], c) for c in prepared["chunks"])
@@ -542,81 +618,77 @@ async def update_incremental(
                     LanceDBVectorStore,
                 )
 
-                kb_key = digest(
-                    encoded(
-                        [
-                            cfg.embedding.model_dump(mode="json", exclude={"api_key"}),
-                            embedding.dimension,
-                        ]
-                    )
-                )
-                location = "shared/kb/" + kb_key
-                store = LanceDBVectorStore(
-                    persist_dir=str(workspace.root / location),
-                    collection_name="workspace",
-                    dimension=embedding.dimension,
-                )
-                base = (
-                    old.get("snapshots", {}).get("kb")
-                    if old and old.get("format_version") == 2
-                    else None
-                )
-                previous_chunks = (
-                    base.get("chunks", {}) if base and base["path"] == location else {}
-                )
+                new_fingerprints = {key: digest(encoded(c)) for key, c in all_chunks.items()}
+                saved_kb = progress["snapshots"].get("kb")
                 if (
-                    base
-                    and base["path"] == location
-                    and store.latest_version != base["version"]
+                    saved_kb
+                    and saved_kb["embedding_fingerprint"] == embedding_fingerprint
+                    and saved_kb["chunks"] == new_fingerprints
+                    and await blocking(kb_version_available, workspace.root, saved_kb)
                 ):
-                    await blocking(store._collection.restore, base["version"])
-                elif not previous_chunks and store.existing_count:
-                    await blocking(store._collection.delete, "true")
-                new_fingerprints = {
-                    key: digest(encoded(c)) for key, c in all_chunks.items()
-                }
-                removed = set(previous_chunks) - set(all_chunks)
-                if removed:
-                    await completed(store.delete(sorted(removed)))
-                changed = [
-                    c
-                    for key, c in all_chunks.items()
-                    if previous_chunks.get(key) != new_fingerprints[key]
-                ]
-                for offset in range(0, len(changed), 256):
-                    batch = changed[offset : offset + 256]
-                    vectors = []
-                    for chunk in batch:
-                        data = (workspace.root / chunk["vector_ref"]).read_bytes()
-                        vectors.append(
-                            list(struct.unpack("<" + "f" * (len(data) // 4), data))
-                        )
-                    await completed(
-                        store.add(
-                            ids=[c["id"] for c in batch],
-                            texts=[c["text"] for c in batch],
-                            embeddings=vectors,
-                            metadatas=[c["metadata"] for c in batch],
-                        )
+                    bindings["kb"] = saved_kb
+                    metrics["resumed_surfaces"].append("kb")
+                else:
+                    if dimension is None:
+                        load_embedding()
+                    kb_key = digest(encoded([embedding_recipe, dimension]))
+                    location = "shared/kb/" + kb_key
+                    store = LanceDBVectorStore(
+                        persist_dir=str(workspace.root / location),
+                        collection_name="workspace",
+                        dimension=dimension,
                     )
-                version = store.latest_version
-                tag = "dm_workspace_" + str(version)
-                if tag not in store._collection.tags.list():
-                    await blocking(store._collection.tags.create, tag, version)
-                bindings["kb"] = {
-                    "provider": "lancedb",
-                    "path": location,
-                    "version": version,
-                    "dimension": embedding.dimension,
-                    "embedding_fingerprint": digest(
-                        encoded(
-                            cfg.embedding.model_dump(mode="json", exclude={"api_key"})
+                    base = old_kb
+                    previous_chunks = (
+                        base.get("chunks", {}) if base and base["path"] == location else {}
+                    )
+                    if (
+                        base
+                        and base["path"] == location
+                        and store.latest_version != base["version"]
+                    ):
+                        await blocking(store._collection.restore, base["version"])
+                    elif not previous_chunks and store.existing_count:
+                        await blocking(store._collection.delete, "true")
+                    removed = set(previous_chunks) - set(all_chunks)
+                    if removed:
+                        await completed(store.delete(sorted(removed)))
+                    changed = [
+                        c
+                        for key, c in all_chunks.items()
+                        if previous_chunks.get(key) != new_fingerprints[key]
+                    ]
+                    for offset in range(0, len(changed), 256):
+                        batch = changed[offset : offset + 256]
+                        vectors = []
+                        for chunk in batch:
+                            data = (workspace.root / chunk["vector_ref"]).read_bytes()
+                            vectors.append(
+                                list(struct.unpack("<" + "f" * (len(data) // 4), data))
+                            )
+                        await completed(
+                            store.add(
+                                ids=[c["id"] for c in batch],
+                                texts=[c["text"] for c in batch],
+                                embeddings=vectors,
+                                metadatas=[c["metadata"] for c in batch],
+                            )
                         )
-                    ),
-                    "chunks": new_fingerprints,
-                }
-                metrics["kb_rows_upserted"] = len(changed)
-                metrics["kb_rows_deleted"] = len(removed)
+                    version = store.latest_version
+                    tag = "dm_workspace_" + str(version)
+                    if tag not in store._collection.tags.list():
+                        await blocking(store._collection.tags.create, tag, version)
+                    bindings["kb"] = {
+                        "provider": "lancedb",
+                        "path": location,
+                        "version": version,
+                        "dimension": dimension,
+                        "embedding_fingerprint": embedding_fingerprint,
+                        "chunks": new_fingerprints,
+                    }
+                    metrics["kb_rows_upserted"] = len(changed)
+                    metrics["kb_rows_deleted"] = len(removed)
+                    save_progress("kb")
             if "db" in selected:
                 base = (
                     old.get("snapshots", {}).get("db")
@@ -624,13 +696,24 @@ async def update_incremental(
                     else None
                 )
                 hashes = {n: t["hash"] for n, t in tables.items()}
-                if base and base["tables"] == hashes:
+                repository = DoltRepository(workspace)
+                saved_db = progress["snapshots"].get("db")
+                if (
+                    saved_db
+                    and saved_db["tables"] == hashes
+                    and await repository.has_commit(saved_db["version"])
+                ):
+                    bindings["db"] = saved_db
+                    metrics["resumed_surfaces"].append("db")
+                elif base and base["tables"] == hashes:
                     bindings["db"] = base
+                    save_progress("db")
                 else:
-                    bindings["db"] = await DoltRepository(workspace).build(
-                        base, tables, revision
-                    )
+                    bindings["db"] = await repository.build(base, tables, revision)
+                    save_progress("db")
                 before = base.get("tables", {}) if base else {}
+                if "db" in metrics["resumed_surfaces"]:
+                    before = hashes
                 metrics["db_tables_reused"] = sum(
                     before.get(n) == v for n, v in hashes.items()
                 )
@@ -640,10 +723,36 @@ async def update_incremental(
                     + len(before.keys() - hashes.keys())
                 )
             if "graph" in selected:
-                bindings["graph"] = {
-                    "provider": "sqlite-source-graph",
-                    "path": "graph.sqlite3",
-                }
+                saved_graph = progress["snapshots"].get("graph")
+                graph_entries = progress.get("graph_sources", {})
+                if (
+                    saved_graph
+                    and progress.get("graph_key") == graph_key
+                    and set(graph_entries) == {item["uri"] for item in sources}
+                    and await blocking(graph_artifacts_available, workspace.root, graph_entries.values())
+                ):
+                    for item in sources:
+                        entry = graph_entries[item["uri"]]
+                        item.update(graph_artifact=entry["graph_artifact"], truncated=entry["truncated"])
+                    bindings["graph"] = saved_graph
+                    metrics["resumed_surfaces"].append("graph")
+                else:
+                    for item in sources:
+                        uri = item["uri"]
+                        assertion = assertions.get(uri)
+                        if assertion is not None:
+                            item["graph_artifact"] = put_graph(workspace.root, assertion["triples"])
+                            item["truncated"] = assertion["truncated"]
+                        else:
+                            previous = prior.get(uri, {})
+                            if previous.get("version") == item["version"] and previous.get("graph_artifact"):
+                                item["graph_artifact"] = previous["graph_artifact"]
+                                item["truncated"] = previous["truncated"]
+                            else:
+                                item["graph_artifact"] = put_graph(workspace.root, [])
+                    bindings["graph"] = {"provider": "sqlite-source-graph", "path": "graph.sqlite3"}
+                    progress["graph_key"] = graph_key
+                    save_progress("graph")
             metrics["materialization_ms"] += (time.monotonic() - start) * 1000
             if await blocking(workspace._inventory, source) != inventory:
                 raise CapabilityError(
@@ -657,6 +766,7 @@ async def update_incremental(
                 "source_root": str(source),
                 "surfaces": sorted(selected),
                 "pipeline_hash": pipeline,
+                "data_pipeline_hash": data_pipeline,
                 "sources": sources,
                 "snapshots": bindings,
                 "reused_sources": metrics["sources_reused"],
@@ -681,6 +791,7 @@ async def update_incremental(
                     "UPDATE head SET revision=?,epoch=epoch+1 WHERE singleton=1",
                     (revision,),
                 )
+                db.execute("DELETE FROM incremental_progress WHERE revision=?", (revision,))
             metrics["publication_ms"] = (time.monotonic() - start) * 1000
             return manifest
         except BaseException as exc:

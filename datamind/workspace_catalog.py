@@ -24,6 +24,10 @@ class WorkspaceCatalog:
                 CREATE INDEX IF NOT EXISTS leases_revision ON leases(revision);
                 CREATE TABLE IF NOT EXISTS protected_versions (revision TEXT PRIMARY KEY);
                 CREATE TABLE IF NOT EXISTS incremental_builds (revision TEXT PRIMARY KEY);
+                CREATE TABLE IF NOT EXISTS incremental_progress (
+                    revision TEXT PRIMARY KEY, parent_epoch INTEGER NOT NULL,
+                    plan TEXT NOT NULL, receipt TEXT NOT NULL
+                );
             """)
             legacy = db.execute("SELECT COUNT(*) FROM revisions").fetchone()[0] > 0
             db.execute(
@@ -220,9 +224,9 @@ class WorkspaceCatalog:
                         r[0]
                         for r in db.execute("SELECT revision FROM protected_versions")
                     }
-                    head = db.execute(
-                        "SELECT revision FROM head WHERE singleton=1"
-                    ).fetchone()[0]
+                    head, epoch = db.execute(
+                        "SELECT revision, epoch FROM head WHERE singleton=1"
+                    ).fetchone()
                     if head:
                         roots.add(head)
                     roots |= active
@@ -232,6 +236,15 @@ class WorkspaceCatalog:
                         roots.update(published)
                     elif policy["mode"] == "recent":
                         roots.update(published[: policy["keep_last"]])
+                    pending = {}
+                    for revision, receipt in db.execute(
+                        "SELECT revision,receipt FROM incremental_progress WHERE parent_epoch=?",
+                        (epoch,),
+                    ):
+                        value = json.loads(receipt)
+                        if value["snapshots"] or value.get("vector_refs"):
+                            pending[revision] = value
+                    roots.update(pending)
                     # Old builders have no heartbeat protocol. Never remove them.
                     building = set()
                     native_builds = {
@@ -239,7 +252,7 @@ class WorkspaceCatalog:
                         for r in db.execute("SELECT revision FROM incremental_builds")
                     }
                     for r, state in rows:
-                        if state != "BUILDING":
+                        if state != "BUILDING" or r in pending:
                             continue
                         marker = self.root / "revisions" / r / "build.json"
                         if r in native_builds or (
@@ -274,11 +287,15 @@ class WorkspaceCatalog:
                     ]
                     retained = []
                     for r in roots:
+                        if r in pending:
+                            retained.append(pending[r])
+                            continue
                         path = self.root / "revisions" / r / "manifest.json"
                         if path.is_file():
                             retained.append(json.loads(path.read_text()))
                     referenced = set()
                     for manifest in retained:
+                        referenced.update(manifest.get("vector_refs", ()))
                         for item in manifest["sources"]:
                             if manifest.get("format_version") == 2:
                                 referenced.add(item["snapshot"])
@@ -336,6 +353,7 @@ class WorkspaceCatalog:
                         [(r,) for r in candidates],
                     )
                     db.execute("DELETE FROM leases WHERE expires<=?", (now,))
+                    db.executemany("DELETE FROM incremental_progress WHERE revision=?", [(r,) for r in candidates])
             # Native versions are removed only after catalog invalidation, so
             # interrupted cleanup cannot leave a readable dangling manifest.
             from datamind.workspace_native import prune_native

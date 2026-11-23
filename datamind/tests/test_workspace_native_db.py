@@ -1,6 +1,7 @@
 """Real Dolt integration: shared snapshots, pruning and rollback baselines."""
 
 import hashlib
+import json
 import shutil
 import pytest
 from datamind.config import Settings
@@ -10,6 +11,79 @@ from datamind.core.errors import CapabilityError
 pytestmark = pytest.mark.skipif(
     shutil.which("dolt") is None, reason="requires real Dolt binary"
 )
+
+
+@pytest.mark.asyncio
+async def test_kb_and_dolt_receipts_survive_kg_failure_and_gc(tmp_path, monkeypatch):
+    pytest.importorskip("lancedb")
+    from datamind import runtime, workspace_graph
+    from datamind.capabilities.kb.providers.lancedb_store import LanceDBVectorStore
+    from datamind.workspace_native import DoltRepository
+    from datamind.tests.test_workspace_incremental import Embed
+
+    monkeypatch.setattr(runtime, "build_embedding", lambda *a, **kw: Embed())
+    source = tmp_path / "sources"
+    source.mkdir()
+    doc = source / "owner.md"
+    doc.write_text("Alice owns Project")
+    data = source / "sales.csv"
+    data.write_text("amount\n12\n")
+    cfg = Settings(_env_file=None, data={"base_dir": tmp_path / "runtime"},
+                   db={"dialect": "dolt"}, kb={"vector_store": "lancedb"},
+                   embedding={"model": "fixture", "dimension": 4},
+                   workspace={"storage_mode": "incremental", "auto_gc": False})
+    w = Workspace(cfg)
+
+    async def update(workspace, owner, relation="owns"):
+        return await workspace.update(str(source), surfaces=("kb", "db", "graph"), graph_sources=[{
+            "uri": str(doc), "version": "sha256:" + hashlib.sha256(doc.read_bytes()).hexdigest(),
+            "triples": [{"subject": owner, "relation": relation, "object": "Project"}],
+        }])
+
+    old = await update(w, "Alice")
+    doc.write_text("Bob owns Project")
+    data.write_text("amount\n24\n")
+
+    def failed_graph(*args, **kwargs):
+        raise OSError("injected KG write failure")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(workspace_graph, "put_graph", failed_graph)
+        with pytest.raises(OSError, match="injected KG"):
+            await update(w, "Bob")
+    assert w.current_revision == old["workspace_revision"]
+    with w._connect() as conn:
+        candidate, receipt = conn.execute("SELECT revision, receipt FROM incremental_progress").fetchone()
+    receipt = json.loads(receipt)["snapshots"]
+    assert set(receipt) == {"kb", "db"}
+    with pytest.raises(CapabilityError):
+        w.manifest(candidate)
+
+    fresh = Workspace(cfg)
+    await fresh.collect(dry_run=False, compact=True)
+
+    def unexpected_work(*args, **kwargs):
+        pytest.fail("completed KB and DB must not be rebuilt")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(runtime, "build_embedding", unexpected_work)
+        patch.setattr(LanceDBVectorStore, "add", unexpected_work)
+        patch.setattr(DoltRepository, "build", unexpected_work)
+        recovered = await update(fresh, "Bob", relation="manages")
+    assert recovered["workspace_revision"] == candidate
+    assert recovered["metrics"]["resumed_surfaces"] == ["kb", "db"]
+    assert recovered["metrics"]["db_tables_changed"] == 0
+    assert recovered["snapshots"]["kb"] == receipt["kb"]
+    assert recovered["snapshots"]["db"] == receipt["db"]
+    with fresh._connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM incremental_progress").fetchone() == (0,)
+    async with fresh.reader(candidate) as reader:
+        graph = await reader.call("graph_neighbors", entity="Project")
+        assert graph["edges"][0]["relation"] == "manages"
+        assert "Bob owns" in str(await reader.call("kb_search", query="owner"))
+        table, = (await reader.call("db_list_tables"))["tables"]
+        rows = await reader.call("db_query_sql", sql=f"SELECT amount FROM `{table}`")
+        assert str(rows["rows"][0][0]) == "24"
 
 
 @pytest.mark.asyncio

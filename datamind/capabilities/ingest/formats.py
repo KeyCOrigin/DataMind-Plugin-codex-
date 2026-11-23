@@ -265,6 +265,19 @@ def extract_document(path: str | Path) -> ExtractedDocument:
     raise RuntimeError(f"no document extractor for '{suffix or '<none>'}'")
 
 
+def xlsx_rows_without_empty_tail(sheet):
+    """Return rows and the last occupied column, preserving column positions."""
+    rows = []
+    width = 0
+    for row in sheet.values:
+        end = len(row)
+        while end and (row[end - 1] is None or row[end - 1] == ""):
+            end -= 1
+        rows.append(row[:end])
+        width = max(width, end)
+    return rows, width
+
+
 def extract_tabular(path: str | Path) -> list[tuple[str, list[str], list[dict[str, Any]]]]:
     """Return ``(table_name, columns, rows)`` for CSV/TSV/XLSX/XLS."""
     source = Path(path).expanduser().resolve()
@@ -288,11 +301,12 @@ def extract_tabular(path: str | Path) -> list[tuple[str, list[str], list[dict[st
         workbook = openpyxl.load_workbook(str(source), read_only=True, data_only=True)
         output: list[tuple[str, list[str], list[dict[str, Any]]]] = []
         for sheet in workbook.worksheets:
-            values = list(sheet.values)
-            if not values:
+            values, width = xlsx_rows_without_empty_tail(sheet)
+            if not width:
                 continue
+            header = values[0] + (None,) * (width - len(values[0]))
             columns = [str(cell).strip() if cell is not None and str(cell).strip() else f"col_{index}"
-                       for index, cell in enumerate(values[0], 1)]
+                       for index, cell in enumerate(header, 1)]
             rows = [dict(zip(columns, list(row) + [None] * (len(columns) - len(row)))) for row in values[1:]]
             output.append((sheet.title, columns, rows))
         return output

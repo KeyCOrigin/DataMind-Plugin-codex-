@@ -46,7 +46,8 @@ def _build_hook_chain(settings: Settings) -> HookChain | None:
     return HookChain(chain_hooks) if chain_hooks else None
 
 
-async def assemble_data_plane(settings: Settings, *, enable: set[str] | None = None, text_client=None, workspace_enable=None):
+async def assemble_data_plane(settings: Settings, *, enable: set[str] | None = None, text_client=None, workspace_enable=None,
+                              embedding: EmbeddingProvider | None = None):
     """An optional explicit text utility client supports custom capability pipelines;
     the default never creates conversation clients or any agent loop.
     """
@@ -58,8 +59,7 @@ async def assemble_data_plane(settings: Settings, *, enable: set[str] | None = N
     settings.ensure_dirs()
 
     client = fallback_client = text_client
-    embedding: EmbeddingProvider | None = None
-    if "kb" in active:
+    if "kb" in active and embedding is None:
         embedding = build_embedding(settings.embedding, fallback_llm=settings.llm)
 
     kb = (

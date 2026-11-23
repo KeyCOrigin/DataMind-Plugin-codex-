@@ -302,6 +302,93 @@ async def test_failed_native_build_does_not_expose_rows_and_reuses_embeddings(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("persist_before_failure", [False, True])
+async def test_mid_file_vector_batches_survive_collection(incremental, monkeypatch, persist_before_failure):
+    from datamind import workspace_incremental as module
+
+    w, root, embed = incremental
+    w.settings.embedding.batch_size = 2
+    # Exercise recovery with dimension inferred from the model.
+    w.settings.embedding.dimension = None
+    parts = [f"distinct segment {i}" for i in range(7)]
+    (root / "long.md").write_text(" ".join(parts))
+    monkeypatch.setattr(module, "_split_text", lambda *a, **kw: parts)
+    write_batch = module.persist_vector_batch
+    calculated_batches = []
+
+    def interrupt(root, batch, vectors, dimension):
+        calculated_batches.append([text for text, _ in batch])
+        should_fail = len(calculated_batches) == 2
+        if not should_fail or persist_before_failure:
+            write_batch(root, batch, vectors, dimension)
+        if should_fail:
+            raise OSError("interrupted in the second embedding batch")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(module, "persist_vector_batch", interrupt)
+        with pytest.raises(OSError, match="second embedding batch"):
+            await w.update(str(root), surfaces=["kb"])
+
+    assert calculated_batches == [parts[:2], parts[2:4]]
+    assert embed.calls == 4
+    assert w.current_revision is None
+    vectors_before_restart = set((w.root / "vectors").glob("*/*.f32"))
+    persisted_count = 4 if persist_before_failure else 2
+    assert len(vectors_before_restart) == persisted_count
+
+    fresh = Workspace(w.settings)
+    await fresh.collect(dry_run=False)
+    assert set((w.root / "vectors").glob("*/*.f32")) == vectors_before_restart
+    replayed = []
+    original_embed = embed.embed_texts
+
+    async def record_replay(texts):
+        replayed.extend(texts)
+        return await original_embed(texts)
+
+    monkeypatch.setattr(embed, "embed_texts", record_replay)
+    result = await fresh.update(str(root), surfaces=["kb"])
+    assert replayed == parts[persisted_count:]
+    assert result["metrics"]["embedding_texts"] == len(replayed)
+    assert fresh.current_revision == result["workspace_revision"]
+    async with fresh.reader() as reader:
+        assert (await reader.call("kb_count"))["chunks"] == len(parts)
+
+
+@pytest.mark.asyncio
+async def test_kb_write_without_receipt_replays_without_reembedding(incremental, monkeypatch):
+    from datamind.capabilities.kb.providers.lancedb_store import LanceDBVectorStore
+    from datamind import runtime
+
+    w, root, _ = incremental
+    a = await publish(w, root, surfaces=("kb", "graph"))
+    add = LanceDBVectorStore.add
+
+    async def fail_after_write(self, *args, **kwargs):
+        await add(self, *args, **kwargs)
+        raise OSError("interrupted before KB receipt")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(LanceDBVectorStore, "add", fail_after_write)
+        with pytest.raises(OSError, match="before KB receipt"):
+            await publish(w, root, "Bob", surfaces=("kb", "graph"))
+    assert w.current_revision == a["workspace_revision"]
+
+    def unexpected_embed(*args, **kwargs):
+        pytest.fail("cached vectors do not require initializing embedding")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(runtime, "build_embedding", unexpected_embed)
+        b = await publish(Workspace(w.settings), root, "Bob", surfaces=("kb", "graph"))
+    assert b["metrics"]["resumed_surfaces"] == []
+    assert b["metrics"]["kb_rows_upserted"] == 1
+    assert b["metrics"]["embedding_calls"] == 0
+    async with w.reader(b["workspace_revision"]) as reader:
+        assert (await reader.call("kb_count"))["chunks"] == 1
+        assert "Bob" in str(await reader.call("kb_search", query="owner"))
+
+
+@pytest.mark.asyncio
 async def test_rollback_aba_during_build_fails_epoch_cas(incremental, monkeypatch):
     import datamind.workspace as module
 
@@ -378,8 +465,12 @@ asyncio.run(w.update(str(root),surfaces=['graph'],graph_sources=[{'uri':str(doc)
     ]
     assert len(building) == 1
     await fresh.collect(dry_run=False)
-    assert fresh.status(building[0])["state"] == "PRUNED"
+    expected_state = "BUILDING" if crash_point == "manifest.json" else "PRUNED"
+    assert fresh.status(building[0])["state"] == expected_state
     b = await publish(fresh, root, "Bob")
+    if crash_point == "manifest.json":
+        assert b["workspace_revision"] == building[0]
+        assert b["metrics"]["resumed_surfaces"] == ["graph"]
     async with fresh.reader(b["workspace_revision"]) as reader:
         assert "Bob" in str(await reader.call("graph_neighbors", entity="Project"))
 

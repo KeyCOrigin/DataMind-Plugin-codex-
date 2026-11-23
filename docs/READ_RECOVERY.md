@@ -67,10 +67,18 @@ are not HTTP request counters, and provider-reported usage may omit failed calls
 Build metrics are observability sidecars, not mutable snapshot contents.
 Caught failures write a metrics sidecar when possible. An abrupt process kill
 cannot finalize metrics; use the external experiment record for that event.
-Re-running `update()` creates a new candidate and reuses complete-source
-checkpoints. The unfinished source is retried in full. Index materialization
-still builds a complete generation; this is compute reuse, not sub-file
-maintenance or automatic background task resumption.
+In snapshot mode, re-running `update()` creates a new candidate and reuses
+complete-source checkpoints. It retries the unfinished source in full and
+materializes a complete generation.
+
+In incremental mode, a retry with the same source inventory, selected surfaces
+and parent epoch can continue an unpublished candidate. The catalog records a
+surface only after its storage version is ready. A retry validates those bindings
+and reports the reused surfaces in `resumed_surfaces`. Missing or unavailable
+bindings return to the existing vector- and table-level recovery paths.
+Correcting graph assertions can reuse the candidate's completed KB and DB.
+Catalog collection protects the candidate's recorded objects and native versions
+until it is published or superseded. Readers remain pinned to published revisions.
 
 ## CPU-only smoke experiments
 
@@ -230,17 +238,69 @@ python -m benchmark.robustness build --source /absolute/workspace \
   --questions /absolute/tasks.jsonl --output /absolute/new-build-experiment
 ```
 
-The worker really exits (`os._exit`) after N source checkpoints or immediately
-before publication. The parent checks that no partial revision was published.
-It copies the same interrupted state for both policies: `cold` removes source
-checkpoints; `resume` retains them. Both rebuild private indexes normally.
-Only experiment-owned copies are removed. Source input is never edited.
+The worker exits with `os._exit(23)` at the selected stage. The parent checks
+that the interrupted revision is unavailable to readers, then copies the same
+interrupted state for three recovery policies.
 
-Results compare recovery-only costs and logical KB/DB/KG content fingerprints.
-Optional downstream probes run after each successful recovery. Fixture probes
-measure retrieval; live probes invoke the agent. Live extraction is potentially
-nondeterministic, so a fingerprint difference is diagnostic, not sufficient proof
-of incorrect recovery. Run downstream gold tasks and repeated trials. To measure
-crash positions at 25/50/75%, select source counts from the supported inventory
-and run each in a fresh output directory. These process-exit tests do not claim
-power-loss durability, distributed recovery, or exactly-once external writes.
+| Policy | Reused state |
+|---|---|
+| `cold` | Rebuild the selected data surfaces after discarding source checkpoints. |
+| `component` | Verify completed KB, DB and graph store files against their recorded hashes. Reuse healthy stores and rebuild incomplete or damaged surfaces, then publish the combined revision. |
+| `resume` | Retain native source checkpoints and materialize a new snapshot through DataMind. |
+
+The component baseline copies physical component files when it joins them to a
+new snapshot. For an intact pre-publication candidate, it can publish the
+verified candidate without rebuilding any component. Reports separate provider
+write counts, bytes copied when reusing component stores, and experiment state
+clone time.
+
+| Stage | Exit point |
+|---|---|
+| `checkpoint` | After the Nth full-source checkpoint specified by `--after`. |
+| `embedding-mid-file` | After a local embedding batch finishes, before that batch is saved, while more chunks in the source await embedding. |
+| `embedding-batch-persisted` | After the selected batch is saved to the incremental vector cache, before the next batch starts. Requires `--native-incremental`. |
+| `partial` | After at least one selected surface completes, while another remains unfinished. |
+| `write-unconfirmed` | After a selected store write returns, before that write returns to the snapshot builder. Use `--crash-component kb\|db\|graph` to choose the store. |
+| `publication` | After the candidate manifest is written, before the catalog publishes it. |
+
+Use `--damage-component db` with the publication stage to damage the private
+SQLite candidate before cloning it for the three strategies. Use
+`--damage-checkpoint` to exercise native repair of malformed source JSON as a
+separate experiment condition. Input workspaces stay intact.
+
+Use `--crash-stage embedding-mid-file --embedding-after-batches 1` with
+`--offline --embedding-model-dir /absolute/local-bge` and the KB surface.
+Snapshot and `--native-incremental` builds both support this stage. The worker
+interrupts the first source with enough remaining batches. In snapshot mode,
+the cut is inside the model call. In incremental mode, the workspace saves
+each batch to its vector cache before starting the next batch. The unpublished
+candidate keeps its vector references through garbage collection. The report
+compares the keys of vectors computed before interruption with those computed
+on restart. A run without an eligible source is recorded as
+`interruption_not_applicable`.
+Use `--embedding-batch-size 8` to process eight chunks per local model batch.
+
+For a batch, supply `--build-units` with a JSON array of objects containing
+`unit` and `source`. Each unit can specify `surfaces`, a `questions` file,
+and a `graph_sources` file. Paths in unit descriptors are relative to the
+batch manifest. Without explicit surfaces the batch selects those applicable
+to the available document and table inputs. `--crash-stage all` runs
+`partial`, `write-unconfirmed`, and `publication` for every unit and records
+inapplicable interruptions separately.
+
+```bash
+python -m benchmark.robustness build --offline --build-units /absolute/units.json \
+  --embedding-model-dir /absolute/local-bge --graph-sources-dir /absolute/local-triples \
+  --questions /absolute/questions.json --crash-stage all --worker-timeout-s 1200 \
+  --output /absolute/new-build-experiment
+```
+
+Offline mode requires Linux and libseccomp and denies IPv4/IPv6 socket creation
+for the runner and its workers. It uses local embeddings and prepared graph
+assertions. The graph input directory contains `<unit>/graph_sources.json`.
+Batch questions are grouped by `unit` and may be wrapped in a `task` field.
+Offline probes accept a `question` for KB retrieval, `sql` for the DB, or
+`entity` for graph neighbors. Probes and logical KB/DB/KG content fingerprints
+are collected after publication. They measure consistency and retrieval hits
+where labeled, while answer quality requires a separate evaluator. These tests
+measure process exits inside the local snapshot workflow.

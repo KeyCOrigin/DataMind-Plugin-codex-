@@ -1,6 +1,7 @@
 """Pinned cross-surface reads, publication failure, and restart checkpoints."""
 import asyncio
 import json
+from contextlib import contextmanager
 
 import pytest
 
@@ -140,6 +141,47 @@ async def test_unchanged_sources_reuse_embeddings_and_extraction(setup_workspace
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize('explicit_builder', [False, True])
+async def test_snapshot_loads_local_embedding_only_for_cache_misses(tmp_path, monkeypatch, explicit_builder):
+    from datamind import runtime
+    from datamind.data_plane import build_data_plane
+
+    source = tmp_path / 'source'
+    source.mkdir()
+    (source / 'a.md').write_text('Alice owns Project')
+    settings = Settings(_env_file=None, data={'base_dir': tmp_path / 'runtime'},
+                        embedding={'provider': 'huggingface', 'model': 'fixture'},
+                        workspace={'storage_mode': 'snapshot', 'auto_gc': False})
+    loads = []
+
+    def build_model(*args, **kwargs):
+        model = Embed()
+        loads.append(model)
+        return model
+
+    monkeypatch.setattr(runtime, 'build_embedding', build_model)
+    builder = build_data_plane if explicit_builder else None
+    workspace = Workspace(settings, builder=builder)
+    await workspace.update(str(source), surfaces=['kb'])
+    assert len(loads) == 1
+
+    warm = await Workspace(settings, builder=builder).update(str(source), surfaces=['kb'])
+    assert len(loads) == 1
+    assert warm['metrics']['embedding_calls'] == 0
+    assert warm['metrics']['sources_reused'] == 1
+
+    (source / 'b.md').write_text('Bob owns Project')
+    (source / 'c.md').write_text('Carol owns Project')
+    restarted = Workspace(settings, builder=builder)
+    mixed = await restarted.update(str(source), surfaces=['kb'])
+    assert len(loads) == 2
+    assert loads[-1].calls == 2
+    assert mixed['metrics']['sources_reused'] == 1
+    async with restarted.reader() as reader:
+        assert (await reader.call('kb_count'))['chunks'] == 3
+
+
+@pytest.mark.asyncio
 async def test_published_db_and_kb_share_same_input_revision(setup_workspace):
     workspace, source, _, _ = setup_workspace
     (source / 'orders.csv').write_text('item,amount\nA,12\n')
@@ -150,6 +192,71 @@ async def test_published_db_and_kb_share_same_input_revision(setup_workspace):
         table = (await reader._system.services.db.list_tables())[0]
         result = await reader.call('db_query_sql', sql=f'SELECT amount FROM "{table}"')
         assert '12' in str(result)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(('broken_source', 'corrupt'), [
+    ('orders.csv', b'{'),
+    ('orders.csv', b'{}'),
+    ('orders.csv', b'{"chunks": [], "vectors": [], "triples": [], "tables": [["broken"]], "truncated": false}'),
+    ('a.md', b'{"chunks": [{"id": "id", "text": "txt", "metadata": {}}], "vectors": [], '
+             b'"triples": [], "tables": [], "truncated": false}'),
+], ids=['invalid-json', 'missing-fields', 'invalid-table', 'missing-vector'])
+async def test_restart_recomputes_only_the_corrupt_checkpoint(setup_workspace, broken_source, corrupt):
+    workspace, source, _, _ = setup_workspace
+    (source / 'orders.csv').write_text('item,amount\nA,12\n')
+    first = await workspace.update(str(source))
+    checkpoints = {item['relative_path']: workspace.root / item['checkpoint'] for item in first['sources']}
+    healthy, = [path for name, path in checkpoints.items() if name != broken_source]
+    healthy_content = healthy.read_bytes()
+    broken = checkpoints[broken_source]
+    original_content = broken.read_bytes()
+    broken.write_bytes(corrupt)
+
+    restarted = Workspace(workspace.settings, builder=workspace._builder)
+    repaired = await restarted.update(str(source))
+    assert repaired['metrics']['sources_reused'] == repaired['metrics']['sources_computed'] == 1
+    assert repaired['metrics']['parsed_table_files'] == (broken_source == 'orders.csv')
+    assert repaired['metrics']['embedding_calls'] == (broken_source == 'a.md')
+    assert repaired['metrics']['graph_extraction_calls'] == (broken_source == 'a.md')
+    assert healthy.read_bytes() == healthy_content
+    assert json.loads(broken.read_bytes()) == json.loads(original_content)
+    quarantined, = broken.parent.glob(f'.{broken.stem}.*.corrupt')
+    assert quarantined.read_bytes() == corrupt
+
+    async def contents(revision):
+        async with restarted.reader(revision) as reader:
+            services = reader._system.services
+            table, = await services.db.list_tables()
+            return (
+                await services.kb.vector_store.get_all_texts(),
+                await services.graph.neighbors('Alice'),
+                (await services.db.query_sql(f'SELECT amount FROM "{table}"')).rows,
+            )
+
+    assert await contents(repaired['workspace_revision']) == await contents(first['workspace_revision'])
+    reused = await restarted.update(str(source))
+    assert reused['metrics']['sources_reused'] == 2
+    assert reused['metrics']['sources_computed'] == 0
+
+
+def test_checkpoint_repair_keeps_an_entry_fixed_before_lock(setup_workspace, monkeypatch):
+    workspace, _, _, _ = setup_workspace
+    checkpoint = workspace.root / 'checkpoint.json'
+    checkpoint.write_text('{')
+    fixed = dict(chunks=[], vectors=[], triples=[], tables=[], truncated=False)
+    acquire_lock = workspace._lock
+
+    @contextmanager
+    def lock_after_other_repair():
+        with acquire_lock():
+            checkpoint.write_text(json.dumps(fixed))
+            yield
+
+    monkeypatch.setattr(workspace, '_lock', lock_after_other_repair)
+    assert workspace._load_checkpoint(checkpoint, source_uri='file:///source/a.md') is not None
+    assert json.loads(checkpoint.read_text()) == fixed
+    assert not list(checkpoint.parent.glob('*.corrupt'))
 
 
 @pytest.mark.asyncio
